@@ -267,7 +267,7 @@ the Zadig driver.
 The *Windows build* GitHub Actions workflow (`.github/workflows/windows-build.yml`)
 does the same on every push and pull request. It runs the test suite on
 Windows, builds the exe, runs its self-test, and uploads the zip as an
-artifact. Pushing a tag such as `v0.1.0` also publishes the zip as a GitHub
+artifact. Pushing a tag such as `v0.0.1` also publishes the zip as a GitHub
 release. When you bump the version, update `sdrscanner/__init__.py`,
 `pyproject.toml` and `packaging/version_info.txt`.
 
