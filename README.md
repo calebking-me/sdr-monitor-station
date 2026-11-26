@@ -548,7 +548,7 @@ does the same on every push and pull request. It runs the test suite on
 Windows, builds the exe, runs its self-test, and uploads the zip as an
 artifact.
 
-To publish a GitHub release with the zip, either push a tag such as `v0.1.0`,
+To publish a GitHub release with the zip, either push a tag such as `v0.2.0`,
 or run the workflow manually on `main` (*Actions → Windows build → Run
 workflow*) with *release_tag* set. A manual run creates the tag for you. In both
 cases the tag must match the app version. When you bump the version, update
