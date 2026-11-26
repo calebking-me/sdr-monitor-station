@@ -19,8 +19,9 @@ import io
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
+from . import dcs
 from .activity import csv_safe
 from .config import (
     DEFAULT_BANDWIDTH, MAX_FREQ, MIN_FREQ, MODE_AM, MODE_FM, ChannelConfig, parse_bool, parse_float,
@@ -31,8 +32,10 @@ MAX_IMPORT_ROWS = 2000
 
 EXPORT_COLUMNS = [
     "name", "frequency_mhz", "mode", "bandwidth_khz", "squelch_db", "hysteresis_db", "hang_time_s",
-    "ctcss_hz", "deemphasis_us", "volume_pct", "pan_pct", "enabled", "record", "audio_device", "color",
+    "hold_time_s", "ctcss_hz", "dcs", "dcs_polarity", "deemphasis_us", "volume_pct", "pan_pct", "enabled",
+    "record", "priority", "alert", "audio_device", "color", "lists",
 ]
+LIST_SEPARATOR = "|"
 
 # normalised header -> (field, unit hint)
 _ALIASES = {
@@ -64,6 +67,14 @@ _ALIASES = {
     "audio_device": ("audio_device", None), "device": ("audio_device", None),
     "audio_output": ("audio_device", None), "output": ("audio_device", None),
     "color": ("color", None), "colour": ("color", None),
+    "dcs": ("dcs", None), "dcs_code": ("dcs", None), "dtcs": ("dcs", None), "dpl": ("dcs", None),
+    "cdcss": ("dcs", None), "dcs_polarity": ("dcs_polarity", None), "polarity": ("dcs_polarity", None),
+    "hold": ("hold_time", None), "hold_time": ("hold_time", None), "hold_time_s": ("hold_time", None),
+    "hold_s": ("hold_time", None), "record_hold": ("hold_time", None),
+    "priority": ("priority", None), "prio": ("priority", None),
+    "alert": ("alert", None), "notify": ("alert", None),
+    "list": ("lists", None), "lists": ("lists", None), "group": ("lists", None), "groups": ("lists", None),
+    "channel_list": ("lists", None), "channel_lists": ("lists", None),
 }
 
 
@@ -74,6 +85,7 @@ class ImportResult:
     warnings: list[str] = field(default_factory=list)   # values that were repaired
     format: str = "native"
     rows_read: int = 0
+    memberships: dict[str, list[str]] = field(default_factory=dict)   # channel id -> list names
 
 
 def _norm_header(h: str) -> str:
@@ -189,10 +201,11 @@ def parse_channels_csv(text: str, default_squelch: float = -50.0) -> ImportResul
             res.rows_read += 1
             cells = {k: (row[i].strip() if i < len(row) else "") for i, k in enumerate(keys)}
             try:
-                d = _chirp_row(cells, res, line_no) if chirp else _native_row(cells)
+                d = _chirp_row(cells, res, line_no) if chirp else _native_row(cells, res, line_no)
             except (ValueError, TypeError) as e:
                 res.errors.append(f"line {line_no}: {e}")
                 continue
+            lists = d.pop("_lists", [])
             d.setdefault("squelch_db", default_squelch)
             try:
                 ch = ChannelConfig.from_dict(d, res.warnings)
@@ -200,12 +213,27 @@ def parse_channels_csv(text: str, default_squelch: float = -50.0) -> ImportResul
                 res.errors.append(f"line {line_no}: {e}")
                 continue
             res.channels.append(ch)
+            if lists:
+                res.memberships[ch.id] = lists
     except csv.Error as e:
         res.errors.append(f"CSV error: {e}")
     return res
 
 
-def _native_row(cells: dict[str, str]) -> dict:
+def _parse_dcs(text: str, polarity: str, res: ImportResult, line_no: int, out: dict) -> None:
+    try:
+        code, pol = dcs.parse_code(text)
+    except ValueError as e:
+        res.warnings.append(f"line {line_no}: {e}; DCS squelch not set")
+        return
+    if code:
+        p = (polarity or "").strip().upper()
+        p = {"N": "N", "NORMAL": "N", "I": "I", "R": "I", "INV": "I", "INVERTED": "I",
+             "EITHER": "either", "BOTH": "either", "ANY": "either"}.get(p, pol or "N")
+        out["dcs_code"], out["dcs_polarity"] = code, p
+
+
+def _native_row(cells: dict[str, str], res: ImportResult, line_no: int) -> dict:
     d: dict = {}
     hints: dict[str, Optional[str]] = {}
     for k, v in cells.items():
@@ -225,8 +253,8 @@ def _native_row(cells: dict[str, str]) -> dict:
     else:
         out["bandwidth"] = mode_bw or DEFAULT_BANDWIDTH[mode]
     out["name"] = d.get("name") or f"{out['frequency'] / 1e6:.4f} MHz"
-    for fname in ("squelch_db", "hysteresis_db", "hang_time", "deemphasis_us"):
-        if fname in d:
+    for fname in ("squelch_db", "hysteresis_db", "hang_time", "hold_time", "deemphasis_us"):
+        if fname in d and d[fname].strip().lower() not in ("off", "none"):
             out[fname] = _number(d[fname])
     if "ctcss_hz" in d:
         out["ctcss_hz"] = d["ctcss_hz"]
@@ -234,9 +262,15 @@ def _native_row(cells: dict[str, str]) -> dict:
         out["volume"] = _number(d["volume"].rstrip("%")) / 100.0
     if "pan" in d:
         out["pan"] = _number(d["pan"].rstrip("%")) / 100.0
-    for fname in ("enabled", "record"):
+    for fname in ("enabled", "record", "priority", "alert"):
         if fname in d:
             out[fname] = parse_bool(d[fname])
+    if "dcs" in d:
+        _parse_dcs(d["dcs"], d.get("dcs_polarity", ""), res, line_no, out)
+        if out.get("dcs_code"):
+            out.pop("ctcss_hz", None)
+    if "lists" in d:
+        out["_lists"] = [n.strip() for n in d["lists"].split(LIST_SEPARATOR) if n.strip()][:16]
     for fname in ("audio_device", "color"):
         if fname in d:
             out[fname] = d[fname]
@@ -256,13 +290,21 @@ def _chirp_row(cells: dict[str, str], res: ImportResult, line_no: int) -> dict:
     name = cells.get("name", "")
     out["name"] = name or f"Mem {cells.get('location', '?')}"
     tone_mode = cells.get("tone", "").strip().lower()
+    # DtcsPolarity is two letters: transmit then receive; R = reversed (inverted).
+    pol = (cells.get("dtcspolarity", "") or "NN").strip().upper()
+    rx_pol = pol[1] if len(pol) >= 2 else "N"
     if mode == MODE_FM:
         if tone_mode == "tsql":
             out["ctcss_hz"] = cells.get("ctonefreq") or cells.get("rtonefreq")
-        elif tone_mode == "cross" and cells.get("crossmode", "").lower().startswith("tone->tone"):
-            out["ctcss_hz"] = cells.get("ctonefreq")
-        elif tone_mode in ("dtcs", "cross"):
-            res.warnings.append(f"line {line_no}: DCS squelch is not supported; using carrier squelch")
+        elif tone_mode == "dtcs":
+            _parse_dcs(cells.get("dtcscode", ""), rx_pol, res, line_no, out)
+        elif tone_mode == "cross":
+            parts = cells.get("crossmode", "").lower().split("->")
+            rx = parts[1].strip() if len(parts) == 2 else ""
+            if rx == "tone":
+                out["ctcss_hz"] = cells.get("ctonefreq")
+            elif rx == "dtcs":
+                _parse_dcs(cells.get("rxdtcscode") or cells.get("dtcscode", ""), rx_pol, res, line_no, out)
     if cells.get("skip", "").strip().upper() == "S":
         out["enabled"] = False
     return out
@@ -272,22 +314,26 @@ def import_channels_csv(path: str | Path, default_squelch: float = -50.0) -> Imp
     return parse_channels_csv(read_text_file(path), default_squelch)
 
 
-def channel_row(ch: ChannelConfig) -> list[str]:
+def channel_row(ch: ChannelConfig, lists: Iterable[str] = ()) -> list[str]:
+    yn = {True: "yes", False: "no"}
     return [
         ch.name, f"{ch.frequency / 1e6:.6f}".rstrip("0").rstrip("."), ch.mode,
         f"{ch.bandwidth / 1e3:g}", f"{ch.squelch_db:g}", f"{ch.hysteresis_db:g}", f"{ch.hang_time:g}",
-        f"{ch.ctcss_hz:.1f}" if ch.ctcss_hz else "", f"{ch.deemphasis_us:g}",
-        f"{ch.volume * 100:g}", f"{ch.pan * 100:g}", "yes" if ch.enabled else "no",
-        "yes" if ch.record else "no", ch.audio_device, ch.color,
+        f"{ch.hold_time:g}", f"{ch.ctcss_hz:.1f}" if ch.ctcss_hz and not ch.dcs_code else "",
+        ch.dcs_code or "", ch.dcs_polarity if ch.dcs_code else "", f"{ch.deemphasis_us:g}",
+        f"{ch.volume * 100:g}", f"{ch.pan * 100:g}", yn[ch.enabled], yn[ch.record], yn[ch.priority],
+        yn[ch.alert], ch.audio_device, ch.color, LIST_SEPARATOR.join(lists),
     ]
 
 
-def export_channels_csv(channels: Iterable[ChannelConfig], path: str | Path) -> int:
+def export_channels_csv(channels: Iterable[ChannelConfig], path: str | Path,
+                        groups_of: Optional[Callable[[str], list[str]]] = None) -> int:
     n = 0
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(EXPORT_COLUMNS)
         for ch in channels:
-            w.writerow([csv_safe(v) for v in channel_row(ch)])
+            lists = groups_of(ch.id) if groups_of else []
+            w.writerow([csv_safe(v) for v in channel_row(ch, lists)])
             n += 1
     return n

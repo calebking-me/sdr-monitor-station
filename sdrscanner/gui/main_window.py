@@ -3,27 +3,31 @@
 from __future__ import annotations
 
 import html
+import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QEvent, QPoint, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence, QPainter, QPen, QShortcut
+from PySide6.QtCore import QByteArray, QEvent, QPoint, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
-    QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog,
+    QLabel, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
+    QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import __version__
 from ..activity import ActivityEvent, event_row, export_csv
 from ..channel_io import export_channels_csv, import_channels_csv
 from ..config import (
-    MAX_CHANNELS, SOURCE_FILE, AppConfig, ChannelConfig, last_profile_path, load_profile, save_profile,
+    MAX_CHANNELS, MAX_GROUPS, MODE_FM, SOURCE_FILE, AppConfig, ChannelConfig, ChannelGroup, last_profile_path,
+    load_profile, save_profile, unique_group_name,
 )
 from ..engine import Engine
 from ..planner import plan_center
 from . import theme
+from .bulk import BulkEditDialog
 from .channels import ChannelDialog, ChannelList, ChannelStrip
+from .lists import ListsDialog
 from .display import DisplayDialog
 from .picker import ChannelPickerDialog, describe_import
 from .settings import SettingsDialog
@@ -32,8 +36,10 @@ from .timeline import ActivityTimeline
 from .view import COLORMAPS, LABEL_MODES, ViewSettings
 from .widgets import plain_label
 
-LOG_COLUMNS = ["Start", "Channel", "Frequency (MHz)", "Mode", "Duration (s)", "Peak (dBFS)", "CTCSS",
+LOG_COLUMNS = ["Start", "Channel", "Frequency (MHz)", "Mode", "Duration (s)", "Peak (dBFS)", "Tone",
                "Recording"]
+ALERT_REPEAT_S = 15.0           # at most one alert per channel in this time
+MANAGE_LISTS = "__manage__"
 MAX_LOG_ROWS = 5000
 RESIZE_MARGIN = 6
 APP_TITLE = "SDR Multi-Channel Scanner"
@@ -42,10 +48,22 @@ SHORTCUTS = (
     ("F5", "Start / stop receiving"), ("Ctrl+N", "Add a channel"), ("Ctrl+P", "Add channels from a preset"),
     ("Ctrl+I", "Import channels from CSV"), ("Ctrl+O / Ctrl+S", "Open / save profile"),
     ("Ctrl+B", "Borderless window on/off"), ("F11", "Full screen on/off"), ("Esc", "Leave full screen"),
+    ("Ctrl+M", "Streamlined view: hide menu bar, toolbar and tabs"),
+    ("Alt+drag", "Move a borderless window from anywhere"),
+    ("Click / Ctrl+click / Shift+click", "Select channels"), ("Ctrl+A", "Select all channels"),
+    ("Ctrl+E", "Edit the selected channels together"), ("Alt+Up / Alt+Down", "Move the selected channels"),
+    ("Drag a channel", "Reorder channels"), ("Del", "Delete the selected channels"),
+    ("Ctrl+L", "Manage channel lists"), ("Ctrl+1 … Ctrl+9", "Monitor channel list 1 … 9"),
+    ("Ctrl+`", "Monitor all channels"),
     ("Ctrl+0", "Show the full captured band"), ("Ctrl+=", "Zoom to the enabled channels"),
     ("Mouse wheel / drag", "Zoom / pan the spectrum and waterfall"),
     ("Double-click spectrum", "Add a channel at that frequency"), ("Right-click spectrum", "More actions"),
 )
+
+
+def menu_text(text: str) -> str:
+    """User text for a menu entry ('&' would otherwise become a keyboard mnemonic)."""
+    return text.replace("&", "&&")
 
 
 def tooltip_text(text: str) -> str:
@@ -68,6 +86,11 @@ class MainWindow(QMainWindow):
         self._last_band = None
         self._was_running = False
         self._mode_before_fullscreen = "normal"
+        self._heard: dict[str, list] = {}          # channel id -> [last end time, count, airtime]
+        self._prev_open: dict[str, bool] = {}
+        self._alerted: dict[str, float] = {}
+        self._tray = None
+        self._app_filter = False
         theme.apply(QApplication.instance(), self.view.theme)
         self.menuBar().setNativeMenuBar(False)       # keep it in-window (needed for borderless dragging)
         self.resize(1280, 900)
@@ -85,7 +108,7 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._tick)
         self.timer.start(40)
         self.timeline_timer = QTimer(self)
-        self.timeline_timer.timeout.connect(self._refresh_timeline)
+        self.timeline_timer.timeout.connect(self._slow_tick)
         self.timeline_timer.start(500)
 
     # ================================================================ building
@@ -114,6 +137,20 @@ class MainWindow(QMainWindow):
         self.act_settings = A("⚙ Radio settings…", self.open_settings)
         self.act_iq = A("● Record IQ", self._toggle_iq, checkable=True,
                         tip="Record the raw wideband IQ to a SigMF file for later playback")
+        self.act_edit_sel = A("Edit selected channels…", self.edit_selected, "Ctrl+E",
+                              tip="Change one or more settings of several channels at once")
+        self.act_select_all = A("Select all channels", lambda: self.channel_list.select_all(), "Ctrl+A")
+        self.act_move_up = A("Move up", lambda: self.move_selected("up"), "Alt+Up")
+        self.act_move_down = A("Move down", lambda: self.move_selected("down"), "Alt+Down")
+        self.act_move_top = A("Move to top", lambda: self.move_selected("top"))
+        self.act_move_bottom = A("Move to bottom", lambda: self.move_selected("bottom"))
+        self.act_duplicate = A("Duplicate selected", self.duplicate_selected)
+        self.act_delete_sel = A("Delete selected…", self.delete_selected, "Del")
+        self.act_lists = A("Manage channel lists…", self.manage_lists, "Ctrl+L",
+                           tip="Named groups of channels you can switch between")
+        self.act_streamlined = A("Streamlined view (hide bars)", lambda v: self._set_view("streamlined", v),
+                                 "Ctrl+M", checkable=True,
+                                 tip="Hide the menu bar, toolbar and panel tabs - press Ctrl+M to bring them back")
 
         tb = QToolBar("Main")
         tb.setObjectName("main_toolbar")
@@ -122,6 +159,13 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
         for a in (self.act_start, self.act_add, self.act_presets, self.act_import, self.act_settings, self.act_iq):
             tb.addAction(a)
+        tb.addSeparator()
+        tb.addWidget(QLabel(" Monitor: "))
+        self.list_combo = QComboBox()
+        self.list_combo.setMinimumWidth(200)
+        self.list_combo.setToolTip("Which channel list to receive (Ctrl+1…9, Ctrl+` for all)")
+        self.list_combo.activated.connect(self._on_list_combo)
+        tb.addWidget(self.list_combo)
 
         mb = self.menuBar()
         m = mb.addMenu("&File")
@@ -132,6 +176,7 @@ class MainWindow(QMainWindow):
         m.addAction(self.act_import)
         m.addAction(self.act_export_ch)
         m.addAction(A("Export activity &log (CSV)…", self.export_log))
+        m.addAction(A("Open recordings folder", self.open_recordings_folder))
         m.addSeparator()
         m.addAction(A("E&xit", self.close, "Ctrl+Q"))
 
@@ -140,6 +185,12 @@ class MainWindow(QMainWindow):
         m.addAction(self.act_presets)
         m.addAction(self.act_import)
         m.addAction(self.act_export_ch)
+        m.addSeparator()
+        m.addAction(self.act_lists)
+        m.addSeparator()
+        for a in (self.act_select_all, self.act_edit_sel, self.act_move_up, self.act_move_down,
+                  self.act_move_top, self.act_move_bottom, self.act_duplicate, self.act_delete_sel):
+            m.addAction(a)
         m.addSeparator()
         m.addAction(A("Enable all", lambda: self._set_all_enabled(True)))
         m.addAction(A("Disable all", lambda: self._set_all_enabled(False)))
@@ -180,7 +231,7 @@ class MainWindow(QMainWindow):
         self.act_compact = A("Compact channel strips", lambda v: self._set_view("compact_strips", v),
                              checkable=True)
         for a in (self.act_show_spec, self.act_show_wf, self.act_show_panel, self.act_show_tb,
-                  self.act_show_sb, self.act_compact):
+                  self.act_show_sb, self.act_compact, self.act_streamlined):
             m.addAction(a)
         sub = m.addMenu("Channel labels")
         self.label_group = QActionGroup(self)
@@ -222,6 +273,9 @@ class MainWindow(QMainWindow):
             "normal" if self.view.window_mode == "borderless" else "borderless"))
         QShortcut(QKeySequence("F11"), self, self.toggle_fullscreen)
         QShortcut(QKeySequence("Esc"), self, self._escape)
+        for n in range(1, 10):
+            QShortcut(QKeySequence(f"Ctrl+{n}"), self, lambda n=n: self._switch_list_number(n))
+        QShortcut(QKeySequence("Ctrl+`"), self, lambda: self.set_active_list(""))
         self.act_on_top = A("Always on top", self.set_always_on_top, checkable=True)
         m.addAction(self.act_on_top)
         m.addSeparator()
@@ -236,8 +290,10 @@ class MainWindow(QMainWindow):
         self.spectrum.frequencyDoubleClicked.connect(lambda f: self.add_channel(f))
         self.spectrum.addChannelRequested.connect(lambda f: self.add_channel(f))
         self.spectrum.zoomToChannelsRequested.connect(self.zoom_to_channels)
+        self.spectrum.extra_actions = [self.act_streamlined]
 
         self.channel_list = ChannelList()
+        self.channel_list.reorderRequested.connect(self.reorder_channels)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.channel_list)
@@ -269,6 +325,8 @@ class MainWindow(QMainWindow):
         self.log_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.log_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.log_table.verticalHeader().setVisible(False)
+        self.log_table.cellDoubleClicked.connect(self._log_double_clicked)
+        self.log_table.setToolTip("Double-click a row with a recording to play it")
         export = QPushButton("Export CSV…")
         export.clicked.connect(self.export_log)
         clear = QPushButton("Clear")
@@ -343,7 +401,8 @@ class MainWindow(QMainWindow):
         for act, val in ((self.act_show_spec, v.show_spectrum), (self.act_show_wf, v.show_waterfall),
                          (self.act_show_panel, v.show_panel), (self.act_show_tb, v.show_toolbar),
                          (self.act_show_sb, v.show_statusbar), (self.act_compact, v.compact_strips),
-                         (self.act_peak, v.peak_hold), (self.act_on_top, v.always_on_top)):
+                         (self.act_peak, v.peak_hold), (self.act_on_top, v.always_on_top),
+                         (self.act_streamlined, v.streamlined)):
             act.blockSignals(True)
             act.setChecked(val)
             act.blockSignals(False)
@@ -351,8 +410,12 @@ class MainWindow(QMainWindow):
         self.spectrum.set_parts(v.show_spectrum, v.show_waterfall)
         self.spectrum.setVisible(v.show_spectrum or v.show_waterfall)
         self.tabs.setVisible(v.show_panel)
-        self.toolbar.setVisible(v.show_toolbar)
+        # Streamlined view: no menu bar, toolbar or tab bar - just spectrum, waterfall and channels.
+        self.menuBar().setVisible(not v.streamlined)
+        self.toolbar.setVisible(v.show_toolbar and not v.streamlined)
+        self.tabs.tabBar().setVisible(not v.streamlined)
         self.statusBar().setVisible(v.show_statusbar)
+        self._update_app_filter()
         self.spectrum.set_colormap(v.colormap)
         self.spectrum.set_options(v.averaging, v.waterfall_speed, v.auto_levels, v.level_min,
                                   v.level_max, v.peak_hold, v.channel_labels)
@@ -373,6 +436,9 @@ class MainWindow(QMainWindow):
         if field == "compact_strips":
             self.rebuild_channels()
         self._apply_view()
+        if field == "streamlined" and value:
+            self.statusBar().showMessage("Streamlined view - press Ctrl+M (or right-click the spectrum) to "
+                                         "show the menus again", 8000)
 
     def set_theme(self, name: str) -> None:
         self.view.theme = name
@@ -394,7 +460,7 @@ class MainWindow(QMainWindow):
             self._apply_view()
 
     def zoom_to_channels(self) -> None:
-        chans = [c for c in self.config.channels if c.enabled]
+        chans = self.config.monitored_channels()
         if not chans:
             self.spectrum.zoom_full()
             return
@@ -449,6 +515,7 @@ class MainWindow(QMainWindow):
         self._win_controls.setVisible(mode == "borderless")
         self._update_margins()
         self.setMouseTracking(mode == "borderless")
+        self._update_app_filter()
         if not show:
             return
         if mode == "fullscreen":
@@ -508,7 +575,22 @@ class MainWindow(QMainWindow):
             return
         super().mousePressEvent(ev)
 
+    def _update_app_filter(self) -> None:
+        """Alt+drag moves a borderless window from anywhere (needed when the menu bar is hidden)."""
+        want = self.view.window_mode == "borderless"
+        app = QApplication.instance()
+        if want and not self._app_filter:
+            app.installEventFilter(self)
+        elif not want and self._app_filter:
+            app.removeEventFilter(self)
+        self._app_filter = want
+
     def eventFilter(self, obj, ev) -> bool:
+        if (self._app_filter and ev.type() == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton
+                and ev.modifiers() & Qt.AltModifier and isinstance(obj, QWidget) and obj.window() is self
+                and self.windowHandle()):
+            self.windowHandle().startSystemMove()
+            return True
         if obj is self.menuBar() and self.view.window_mode == "borderless":
             t = ev.type()
             if t in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick) and ev.button() == Qt.LeftButton:
@@ -529,17 +611,25 @@ class MainWindow(QMainWindow):
 
     # ================================================================ channels
     def rebuild_channels(self) -> None:
-        self.channel_list.rebuild(self.config.channels, self._connect_strip, self.view.compact_strips)
-        self.spectrum.set_channels(self.config.channels)
+        visible = self.config.visible_channels()
+        empty = ""
+        if self.config.active_group and not visible:
+            empty = (f"The channel list '{html.escape(self.config.active_group)}' is empty. Add channels to it "
+                     "with <b>Channels → Manage channel lists…</b> or the channel's right-click menu.")
+        self.channel_list.rebuild(visible, self._connect_strip, self.view.compact_strips, empty)
+        self.spectrum.set_channels(self.config.monitored_channels())
+        self._refresh_list_combo()
+        self._refresh_heard()
 
     def _connect_strip(self, s: ChannelStrip) -> None:
         s.structureChanged.connect(self._channels_changed)
         s.editRequested.connect(self.edit_channel)
         s.deleteRequested.connect(self.delete_channel)
+        s.contextRequested.connect(self._strip_menu)
 
     def _channels_changed(self) -> None:
         self.engine.channels_changed()
-        self.spectrum.set_channels(self.config.channels)
+        self.spectrum.set_channels(self.config.monitored_channels())
         self._update_plan_preview()
 
     def _ask(self, title: str, text: str) -> bool:
@@ -563,56 +653,326 @@ class MainWindow(QMainWindow):
             freq = self.config.channels[-1].frequency + 25_000 if self.config.channels else (
                 self.engine.center or self.config.radio.manual_center)
         ch = ChannelConfig(name=f"Channel {n}", frequency=float(freq), color=self.config.next_color())
-        dlg = ChannelDialog(ch, self, "Add channel")
+        active = self.config.group(self.config.active_group)
+        if active is not None:
+            active.ids.append(ch.id)              # new channels join the list being monitored
+        dlg = ChannelDialog(ch, self, "Add channel", self.config.groups)
         if dlg.exec():
             dlg.apply()
             self.config.channels.append(ch)
             self.rebuild_channels()
             self._channels_changed()
+        elif active is not None:
+            active.ids.remove(ch.id)
 
     def edit_channel(self, ch_id: str) -> None:
         ch = self.config.channel(ch_id)
         if ch is None:
             return
-        dlg = ChannelDialog(ch, self, f"Edit {ch.name}")
+        dlg = ChannelDialog(ch, self, f"Edit {ch.name}", self.config.groups)
         if dlg.exec():
             dlg.apply()
-            self.channel_list.strips[ch_id].refresh_from_config()
+            if ch_id in self.channel_list.strips and ch in self.config.visible_channels():
+                self.channel_list.strips[ch_id].refresh_from_config()
+            else:
+                self.rebuild_channels()            # it left the list being shown
+            self._refresh_list_combo()
             self._channels_changed()
+
+    def _selection_or(self, cid: str | None = None) -> list[str]:
+        sel = list(self.channel_list.selected)
+        if cid is not None and cid not in sel:
+            sel = [cid]
+            self.channel_list.set_selection(sel)
+        return sel
 
     def delete_channel(self, ch_id: str) -> None:
         ch = self.config.channel(ch_id)
         if ch is None or not self._ask("Delete channel", f"Delete '{ch.name}'?"):
             return
-        self.config.channels.remove(ch)
+        self._remove_channels([ch_id])
+
+    def delete_selected(self) -> None:
+        ids = self._selection_or()
+        if not ids:
+            return
+        names = [self.config.channel(i).name for i in ids if self.config.channel(i)]
+        text = f"Delete '{names[0]}'?" if len(names) == 1 else f"Delete {len(names)} channels?"
+        if self._ask("Delete channels", text):
+            self._remove_channels(ids)
+
+    def _remove_channels(self, ids) -> None:
+        drop = set(ids)
+        self.config.channels[:] = [c for c in self.config.channels if c.id not in drop]
+        self.config.prune_groups()
+        for cid in drop:
+            self.engine.mute_until.pop(cid, None)
+        self.channel_list.set_selection([])
         self.rebuild_channels()
         self._channels_changed()
 
-    def add_channels(self, channels: list[ChannelConfig], replace: bool = False) -> int:
+    def duplicate_selected(self) -> None:
+        ids = self._selection_or()
+        new_ids = []
+        for cid in ids:
+            src = self.config.channel(cid)
+            if src is None or len(self.config.channels) >= MAX_CHANNELS:
+                continue
+            dup = src.copy(id=ChannelConfig().id, name=(src.name + " copy")[:64], color=self.config.next_color())
+            self.config.channels.insert(self.config.channels.index(src) + 1, dup)
+            for g in self.config.groups:
+                if cid in g.ids:
+                    g.ids.append(dup.id)
+            new_ids.append(dup.id)
+        self.rebuild_channels()
+        self.channel_list.set_selection(new_ids)
+        self._channels_changed()
+
+    def edit_selected(self) -> None:
+        ids = list(self.channel_list.selected)
+        dlg = BulkEditDialog(self.config, ids, self, noise_of=self._noise_of)
+        if dlg.exec():
+            n = dlg.apply()
+            self.rebuild_channels()
+            self.channel_list.set_selection(dlg.changed_ids)
+            self._channels_changed()
+            self.statusBar().showMessage(f"Updated {n} channel(s)", 5000)
+
+    def _noise_of(self, cid: str):
+        strip = self.channel_list.strips.get(cid)
+        return strip.noise_db if strip is not None else None
+
+    # ---------------------------------------------------------------- ordering
+    def _visible_ids(self) -> list[str]:
+        return [c.id for c in self.config.visible_channels()]
+
+    def _apply_visible_order(self, new_ids: list[str]) -> None:
+        """Reorder the shown channels; channels hidden by the active list keep their places."""
+        wanted = set(new_ids)
+        slots = [i for i, c in enumerate(self.config.channels) if c.id in wanted]
+        by_id = {c.id: c for c in self.config.channels}
+        for slot, cid in zip(slots, new_ids):
+            self.config.channels[slot] = by_id[cid]
+        keep = list(self.channel_list.selected)
+        self.rebuild_channels()
+        self.channel_list.set_selection(keep)
+
+    def reorder_channels(self, ids: list[str], index: int) -> None:
+        vis = self._visible_ids()
+        moving = [i for i in vis if i in set(ids)]
+        if not moving:
+            return
+        rest = [i for i in vis if i not in set(moving)]
+        insert_at = len([i for i in vis[:index] if i not in set(moving)])
+        self._apply_visible_order(rest[:insert_at] + moving + rest[insert_at:])
+
+    def move_selected(self, how: str) -> None:
+        vis = self._visible_ids()
+        sel = set(self.channel_list.selected)
+        if not sel:
+            return
+        if how == "top":
+            new = [i for i in vis if i in sel] + [i for i in vis if i not in sel]
+        elif how == "bottom":
+            new = [i for i in vis if i not in sel] + [i for i in vis if i in sel]
+        else:
+            new = list(vis)
+            rng = range(1, len(new)) if how == "up" else range(len(new) - 2, -1, -1)
+            step = -1 if how == "up" else 1
+            for i in rng:
+                j = i + step
+                if new[i] in sel and new[j] not in sel:
+                    new[i], new[j] = new[j], new[i]
+        if new != vis:
+            self._apply_visible_order(new)
+
+    # ---------------------------------------------------------------- channel lists
+    def _refresh_list_combo(self) -> None:
+        c = self.list_combo
+        c.blockSignals(True)
+        c.clear()
+        c.addItem(f"All channels ({len(self.config.channels)})", "")
+        for g in self.config.groups:
+            c.addItem(f"{g.name} ({len(g.ids)})", g.name)
+        c.insertSeparator(c.count())
+        c.addItem("Manage lists…", MANAGE_LISTS)
+        c.setCurrentIndex(max(0, c.findData(self.config.active_group)))
+        c.blockSignals(False)
+
+    def _on_list_combo(self, index: int) -> None:
+        data = self.list_combo.itemData(index)
+        if data == MANAGE_LISTS:
+            self._refresh_list_combo()
+            self.manage_lists()
+        else:
+            self.set_active_list(data or "")
+
+    def _switch_list_number(self, n: int) -> None:
+        if 1 <= n <= len(self.config.groups):
+            self.set_active_list(self.config.groups[n - 1].name)
+
+    def set_active_list(self, name: str) -> None:
+        g = self.config.group(name) if name else None
+        self.config.active_group = g.name if g is not None else ""
+        self.channel_list.set_selection([])
+        self.rebuild_channels()
+        self._channels_changed()
+        label = f"'{g.name}' ({len(g.ids)} channels)" if g is not None else "all channels"
+        self.statusBar().showMessage(f"Monitoring {label}", 5000)
+
+    def manage_lists(self) -> None:
+        dlg = ListsDialog(self.config, self, select=self.config.active_group)
+        if dlg.exec():
+            self.config.groups = dlg.result_groups()
+            if self.config.active_group and self.config.group(self.config.active_group) is None:
+                self.config.active_group = ""
+            self.rebuild_channels()
+            self._channels_changed()
+
+    def _add_to_list(self, ids: list[str], name: str) -> None:
+        g = self.config.group(name)
+        if g is None:
+            if len(self.config.groups) >= MAX_GROUPS:
+                return
+            g = ChannelGroup(unique_group_name(self.config, name))
+            self.config.groups.append(g)
+        for cid in ids:
+            if cid not in g.ids:
+                g.ids.append(cid)
+        self._refresh_list_combo()
+        if self.config.active_group == g.name:
+            self.rebuild_channels()
+            self._channels_changed()
+
+    def _new_list_from(self, ids: list[str]) -> None:
+        text, ok = QInputDialog.getText(self, "New channel list", "List name:")
+        if ok and text.strip():
+            self._add_to_list(ids, text)
+
+    def _remove_from_active_list(self, ids: list[str]) -> None:
+        g = self.config.group(self.config.active_group)
+        if g is not None:
+            g.ids = [i for i in g.ids if i not in set(ids)]
+            self.rebuild_channels()
+            self._channels_changed()
+
+    # ---------------------------------------------------------------- strip context menu
+    def _strip_menu(self, cid: str, pos) -> None:
+        ch = self.config.channel(cid)
+        if ch is None:
+            return
+        ids = self._selection_or(cid)
+        n = len(ids)
+        menu = QMenu(self)
+        menu.addAction("Edit…", lambda: self.edit_channel(cid))
+        menu.addAction(f"Edit {n} channels together…" if n > 1 else "Edit with bulk editor…", self.edit_selected)
+        menu.addSeparator()
+        for act in (self.act_move_up, self.act_move_down, self.act_move_top, self.act_move_bottom):
+            menu.addAction(act)
+        menu.addSeparator()
+        sub = menu.addMenu("Add to channel list")
+        for g in self.config.groups:
+            a = sub.addAction(menu_text(g.name), lambda name=g.name: self._add_to_list(ids, name))
+            a.setCheckable(True)
+            a.setChecked(all(i in g.ids for i in ids))
+        if self.config.groups:
+            sub.addSeparator()
+        sub.addAction("New list…", lambda: self._new_list_from(ids))
+        if self.config.active_group:
+            menu.addAction(f"Remove from '{menu_text(self.config.active_group)}'",
+                           lambda: self._remove_from_active_list(ids))
+        menu.addSeparator()
+        sub = menu.addMenu("Mute for")
+        for minutes in (5, 15, 60):
+            sub.addAction(f"{minutes} minutes", lambda m=minutes: self.mute_for(ids, m * 60))
+        if any(self.engine.mute_until.get(i, 0) > time.time() for i in ids):
+            menu.addAction("Unmute now", lambda: self.mute_for(ids, 0))
+        strip = self.channel_list.strips.get(cid)
+        st = strip.last_status if strip is not None else None
+        if ch.mode == MODE_FM and st is not None and (st.dcs or st.tone):
+            label = f"DCS {st.dcs}" if st.dcs else f"CTCSS {st.tone:.1f}"
+            menu.addAction(f"Use detected {label} as tone squelch", lambda: self.learn_tone(cid))
+        menu.addAction("Set squelch from noise floor", lambda: self.auto_squelch(ids))
+        menu.addSeparator()
+        menu.addAction(self.act_duplicate)
+        menu.addAction(self.act_delete_sel)
+        if self.view.streamlined:
+            menu.addSeparator()
+            menu.addAction(self.act_streamlined)
+        menu.exec(pos)
+
+    def mute_for(self, ids: list[str], seconds: float) -> None:
+        until = time.time() + seconds
+        for cid in ids:
+            if seconds > 0:
+                self.engine.mute_until[cid] = until
+            else:
+                self.engine.mute_until.pop(cid, None)
+        self._refresh_temp_mutes()
+
+    def learn_tone(self, cid: str) -> None:
+        ch = self.config.channel(cid)
+        strip = self.channel_list.strips.get(cid)
+        st = strip.last_status if strip is not None else None
+        if ch is None or st is None:
+            return
+        if st.dcs:
+            ch.dcs_code, ch.dcs_polarity, ch.ctcss_hz = st.dcs[:3], st.dcs[3:] or "N", None
+        elif st.tone:
+            ch.ctcss_hz, ch.dcs_code = st.tone, None
+        strip.refresh_from_config()
+        self.statusBar().showMessage(f"{ch.name}: tone squelch set to {ch.tone_text()}", 5000)
+
+    def auto_squelch(self, ids: list[str]) -> None:
+        for cid in ids:
+            strip = self.channel_list.strips.get(cid)
+            if strip is not None and strip.noise_db is not None:
+                strip.auto_squelch()
+
+    def add_channels(self, channels: list[ChannelConfig], replace: bool = False, list_name: str = "",
+                     monitor: bool = False, memberships: dict | None = None) -> int:
         """Add (or replace with) a batch of channels, e.g. from CSV import or a preset."""
         if replace:
             self.config.channels.clear()
+            self.config.prune_groups()
         ids = {c.id for c in self.config.channels}
-        added = 0
+        added: list[str] = []
+        id_map: dict[str, str] = {}
         for c in channels:
             if len(self.config.channels) >= MAX_CHANNELS:
                 break
+            orig = c.id
             if c.id in ids:
                 c = c.copy(id=ChannelConfig().id)
             if not c.color:
                 c.color = self.config.next_color()
             self.config.channels.append(c)
             ids.add(c.id)
-            added += 1
+            id_map[orig] = c.id
+            added.append(c.id)
+        for orig, names in (memberships or {}).items():
+            if orig in id_map:
+                for name in names:
+                    self._add_to_list([id_map[orig]], name)
+        active = self.config.group(self.config.active_group)
+        if active is not None and not list_name:
+            active.ids.extend(i for i in added if i not in active.ids)
+        if list_name and added:
+            name = unique_group_name(self.config, list_name)
+            if len(self.config.groups) < MAX_GROUPS:
+                self.config.groups.append(ChannelGroup(name, list(added)))
+                if monitor:
+                    self.config.active_group = name
         self.rebuild_channels()
         self._channels_changed()
-        self.statusBar().showMessage(f"Added {added} channel(s)", 6000)
-        return added
+        self.statusBar().showMessage(f"Added {len(added)} channel(s)", 6000)
+        return len(added)
 
     def add_from_preset(self) -> None:
         dlg = ChannelPickerDialog(self.config, self, title="Add channels from a preset list", use_presets=True)
         if dlg.exec():
-            self.add_channels(dlg.selected_channels(), dlg.replace_existing())
+            name, monitor = dlg.new_list()
+            self.add_channels(dlg.selected_channels(), dlg.replace_existing(), name, monitor)
 
     def import_channels(self, path: str | None = None) -> None:
         if not path:
@@ -632,45 +992,46 @@ class MainWindow(QMainWindow):
         dlg = ChannelPickerDialog(
             self.config, self, title="Import channels", candidates=res.channels,
             source_text=describe_import(Path(path).name, res.format, len(res.channels), res.rows_read),
-            problems=res.errors + res.warnings)
+            problems=res.errors + res.warnings, list_name=Path(path).stem[:40])
         if dlg.exec():
-            self.add_channels(dlg.selected_channels(), dlg.replace_existing())
+            name, monitor = dlg.new_list()
+            self.add_channels(dlg.selected_channels(), dlg.replace_existing(), name, monitor, res.memberships)
 
     def export_channels(self) -> None:
-        if not self.config.channels:
+        chans = self.config.visible_channels()
+        if not chans:
             self._notify("Export channels", "There are no channels to export.")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Export channels", "channels.csv", "CSV (*.csv)")
         if path:
-            n = export_channels_csv(self.config.channels, path)
+            n = export_channels_csv(chans, path, self.config.groups_of)
             self.statusBar().showMessage(f"Exported {n} channels to {path}", 6000)
 
     def _set_all_enabled(self, on: bool) -> None:
-        for c in self.config.channels:
+        for c in self.config.visible_channels():
             c.enabled = on
         self.channel_list.refresh_all()
         self._channels_changed()
 
     def sort_channels(self) -> None:
-        self.config.channels.sort(key=lambda c: (c.frequency, c.name))
-        self.rebuild_channels()
+        vis = sorted(self.config.visible_channels(), key=lambda c: (c.frequency, c.name))
+        self._apply_visible_order([c.id for c in vis])
 
     def set_all_squelch(self) -> None:
-        if not self.config.channels:
+        chans = self.config.visible_channels()
+        if not chans:
             return
-        cur = self.config.channels[0].squelch_db
-        val, ok = QInputDialog.getDouble(self, "Set squelch for all", "Squelch level (dBFS):", cur, -150, 0, 0)
+        val, ok = QInputDialog.getDouble(self, "Set squelch for all", "Squelch level (dBFS):",
+                                         chans[0].squelch_db, -150, 0, 0)
         if ok:
-            for c in self.config.channels:
+            for c in chans:
                 c.squelch_db = float(val)
             self.channel_list.refresh_all()
 
     def remove_all_channels(self) -> None:
         if self.config.channels and self._ask("Remove all channels",
                                               f"Remove all {len(self.config.channels)} channels?"):
-            self.config.channels.clear()
-            self.rebuild_channels()
-            self._channels_changed()
+            self._remove_channels([c.id for c in self.config.channels])
 
     def _update_plan_preview(self) -> None:
         r = self.config.radio
@@ -680,7 +1041,7 @@ class MainWindow(QMainWindow):
             self.status_plan.setText("IQ file playback: centre frequency comes from the recording")
             self.status_plan.setToolTip("")
             return
-        plan = plan_center(self.config.channels, r.sample_rate, r.auto_center, r.manual_center)
+        plan = plan_center(self.config.monitored_channels(), r.sample_rate, r.auto_center, r.manual_center)
         self._show_plan(plan)
 
     def _show_plan(self, plan) -> None:
@@ -776,6 +1137,11 @@ class MainWindow(QMainWindow):
             st = snap.channels.get(cid)
             strip.update_status(st if snap.running else None)
         self.spectrum.set_active({cid: st.open for cid, st in snap.channels.items()})
+        for cid, st in snap.channels.items():
+            was = self._prev_open.get(cid, False)
+            if st.open and not was:
+                self._on_channel_opened(cid)
+            self._prev_open[cid] = st.open
         for ev in snap.events:
             self._add_event(ev)
         if snap.running:
@@ -787,10 +1153,69 @@ class MainWindow(QMainWindow):
         else:
             self.status_load.setText("")
 
+    def _slow_tick(self) -> None:
+        self._refresh_timeline()
+        self._refresh_temp_mutes()
+
     def _refresh_timeline(self) -> None:
         if self.tabs.currentIndex() == 1 and self.tabs.isVisible():
-            self.timeline.set_data(self.config.channels, self.engine.history_snapshot(),
+            self.timeline.set_data(self.config.visible_channels(), self.engine.history_snapshot(),
                                    self.timeline_minutes.value())
+
+    def _refresh_temp_mutes(self) -> None:
+        now = time.time()
+        mutes = self.engine.mute_until
+        for cid, until in list(mutes.items()):
+            if until <= now:
+                mutes.pop(cid, None)
+        for cid, strip in self.channel_list.strips.items():
+            strip.set_temp_mute(mutes.get(cid))
+
+    # ---------------------------------------------------------------- alerts and "last heard"
+    def _on_channel_opened(self, cid: str) -> None:
+        ch = self.config.channel(cid)
+        if ch is None or not ch.alert:
+            return
+        now = time.time()
+        if now - self._alerted.get(cid, 0.0) < ALERT_REPEAT_S:
+            return
+        self._alerted[cid] = now
+        text = f"{ch.name} is active ({ch.frequency / 1e6:.4f} MHz)"
+        self.messages.appendPlainText(f"[{datetime.now():%H:%M:%S}] Alert: {text}")
+        shown = False
+        if self.config.alert_popup:
+            tray = self._ensure_tray()
+            if tray is not None:
+                tray.showMessage("SDR Scanner", text, QSystemTrayIcon.Information, 6000)
+                shown = True
+        if not shown:
+            self.statusBar().showMessage(f"⚑ {text}", 8000)
+        if self.config.alert_sound:
+            QApplication.beep()
+
+    def _ensure_tray(self):
+        if self._tray is None and QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = QSystemTrayIcon(QApplication.windowIcon(), self)
+            self._tray.setToolTip(APP_TITLE)
+            self._tray.activated.connect(lambda *_: (self.showNormal(), self.raise_(), self.activateWindow()))
+            self._tray.show()
+        return self._tray
+
+    def _note_heard(self, ev: ActivityEvent) -> None:
+        h = self._heard.setdefault(ev.channel_id, [0.0, 0, 0.0])
+        h[0] = max(h[0], ev.end)
+        h[1] += 1
+        h[2] += ev.duration
+
+    def _refresh_heard(self) -> None:
+        for cid, strip in self.channel_list.strips.items():
+            h = self._heard.get(cid)
+            if not h:
+                strip.set_heard("")
+                continue
+            last, count, airtime = h
+            strip.set_heard(f"last {datetime.fromtimestamp(last):%H:%M:%S} · {count}×",
+                            f"{count} transmission(s), {airtime:.0f} s on air this session")
 
     def _on_timeline_minutes(self, v: int) -> None:
         self.config.timeline_minutes = v
@@ -804,11 +1229,37 @@ class MainWindow(QMainWindow):
         row = event_row(ev)
         self.log_table.insertRow(0)
         vals = [row["start"], row["channel"], row["frequency_mhz"], row["mode"], row["duration_s"],
-                row["peak_dbfs"], row["ctcss_hz"], row["recording"]]
+                row["peak_dbfs"], ev.tone_text, row["recording"]]
         for i, v in enumerate(vals):
-            self.log_table.setItem(0, i, QTableWidgetItem(v))
+            item = QTableWidgetItem(v)
+            if i == 0:
+                item.setData(Qt.UserRole, ev.recording)
+            self.log_table.setItem(0, i, item)
         if self.log_table.rowCount() > MAX_LOG_ROWS:
             self.log_table.removeRow(self.log_table.rowCount() - 1)
+        self._note_heard(ev)
+        self._refresh_heard()
+
+    def _log_double_clicked(self, row: int, _col: int) -> None:
+        item = self.log_table.item(row, 0)
+        path = item.data(Qt.UserRole) if item is not None else ""
+        if not path:
+            self.statusBar().showMessage("That transmission was not recorded", 4000)
+            return
+        p = Path(path)
+        if not p.is_file():
+            self.statusBar().showMessage(f"Recording not found: {p.name}", 5000)
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(p)))
+
+    def open_recordings_folder(self) -> None:
+        d = self.config.effective_recordings_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._notify("Recordings", f"Cannot create {d}:\n{e}", QMessageBox.Warning)
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(d)))
 
     def _clear_log(self) -> None:
         self.events.clear()
@@ -842,6 +1293,9 @@ class MainWindow(QMainWindow):
         self.engine.spectrum_fft = self.view.fft_size
         self.timeline_minutes.setValue(cfg.timeline_minutes)
         self._last_band = None
+        self._heard.clear()
+        self._prev_open.clear()
+        self.channel_list.set_selection([])
         self.rebuild_channels()
         self._update_plan_preview()
         self._show_load_warnings(cfg)

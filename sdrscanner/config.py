@@ -19,9 +19,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-PROFILE_VERSION = 2
+from . import dcs
+
+PROFILE_VERSION = 3
 MAX_PROFILE_BYTES = 5 * 1024 * 1024
 MAX_CHANNELS = 256
+MAX_GROUPS = 64
+MAX_GROUP_NAME = 40
+DEFAULT_HOLD_TIME = 2.0
 
 SOURCE_RTLSDR = "rtlsdr"
 SOURCE_RTLTCP = "rtl_tcp"
@@ -171,6 +176,8 @@ class ChannelConfig:
     hysteresis_db: float = 3.0            # closes at squelch_db - hysteresis_db
     hang_time: float = 0.5                # seconds squelch stays open after signal drops
     ctcss_hz: Optional[float] = None      # None = carrier squelch only (FM only)
+    dcs_code: Optional[str] = None        # DCS tone squelch, e.g. "023" (FM only; wins over CTCSS)
+    dcs_polarity: str = "N"               # "N", "I" or "either"
     deemphasis_us: float = 750.0          # 0 disables de-emphasis (FM only)
     volume: float = 1.0                   # linear gain, 0..2
     pan: float = 0.0                      # -1 = left only, 0 = centre, +1 = right only
@@ -178,6 +185,9 @@ class ChannelConfig:
     solo: bool = False
     audio_device: str = ""                # "" = system default output
     record: bool = False                  # write each transmission to WAV
+    hold_time: float = DEFAULT_HOLD_TIME  # s: gaps shorter than this stay in one recording / log entry
+    priority: bool = False                # other channels are ducked while this one is active
+    alert: bool = False                   # pop-up / sound when this channel becomes active
     color: str = ""
     id: str = field(default_factory=_new_id)
 
@@ -210,7 +220,19 @@ class ChannelConfig:
         except (TypeError, ValueError) as e:
             fx.warn(f"{e}; tone squelch disabled")
             ch.ctcss_hz = None
+        try:
+            code, pol = dcs.parse_code(d.get("dcs_code") or "")
+        except ValueError as e:
+            fx.warn(f"{e}; DCS squelch disabled")
+            code, pol = None, None
+        ch.dcs_code = code
+        polarity = str(d.get("dcs_polarity") or pol or "N")
+        ch.dcs_polarity = polarity if polarity in dcs.POLARITIES else "N"
         if ch.mode == MODE_AM:
+            ch.ctcss_hz = None
+            ch.dcs_code = None
+        if ch.dcs_code and ch.ctcss_hz:
+            fx.warn("both CTCSS and DCS were set; using DCS")
             ch.ctcss_hz = None
         ch.deemphasis_us = fx.num(d.get("deemphasis_us", 750.0), 750.0, 0.0, 2000.0, "de-emphasis")
         ch.volume = fx.num(d.get("volume", 1.0), 1.0, 0.0, 2.0, "volume")
@@ -218,6 +240,9 @@ class ChannelConfig:
         ch.mute = fx.boolean(d.get("mute", False), False, "mute")
         ch.solo = fx.boolean(d.get("solo", False), False, "solo")
         ch.record = fx.boolean(d.get("record", False), False, "record")
+        ch.hold_time = fx.num(d.get("hold_time", DEFAULT_HOLD_TIME), DEFAULT_HOLD_TIME, 0.0, 30.0, "hold time")
+        ch.priority = fx.boolean(d.get("priority", False), False, "priority")
+        ch.alert = fx.boolean(d.get("alert", False), False, "alert")
         ch.audio_device = clean_text(d.get("audio_device", ""), 256)
         ch.color = clean_color(d.get("color", ""))
         cid = str(d.get("id", "") or "")
@@ -232,6 +257,24 @@ class ChannelConfig:
         d = asdict(self)
         d.update(changes)
         return ChannelConfig(**d)
+
+    def tone_text(self) -> str:
+        """Human-readable tone squelch setting ('' for carrier squelch)."""
+        if self.mode == MODE_AM:
+            return ""
+        if self.dcs_code:
+            return dcs.describe(self.dcs_code, self.dcs_polarity)
+        if self.ctcss_hz:
+            return f"CTCSS {self.ctcss_hz:.1f}"
+        return ""
+
+
+@dataclass
+class ChannelGroup:
+    """A named channel list ("scan list") that can be monitored on its own."""
+
+    name: str
+    ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -285,6 +328,11 @@ class AppConfig:
     channels: list[ChannelConfig] = field(default_factory=list)
     recordings_dir: str = ""
     timeline_minutes: int = 10
+    groups: list[ChannelGroup] = field(default_factory=list)
+    active_group: str = ""                # "" = monitor all channels
+    priority_duck_db: float = -15.0       # level of other channels while a priority channel is active
+    alert_sound: bool = True
+    alert_popup: bool = True
     # Problems found while loading (not saved).
     load_warnings: list[str] = field(default_factory=list, repr=False, compare=False)
 
@@ -295,6 +343,11 @@ class AppConfig:
             "channels": [asdict(c) for c in self.channels],
             "recordings_dir": self.recordings_dir,
             "timeline_minutes": self.timeline_minutes,
+            "groups": [{"name": g.name, "ids": list(g.ids)} for g in self.groups],
+            "active_group": self.active_group,
+            "priority_duck_db": self.priority_duck_db,
+            "alert_sound": self.alert_sound,
+            "alert_popup": self.alert_popup,
         }
 
     @classmethod
@@ -327,10 +380,49 @@ class AppConfig:
             channels=channels,
             recordings_dir=str(d.get("recordings_dir", "") or "")[:4096],
             timeline_minutes=fx.integer(d.get("timeline_minutes", 10), 10, 1, 240, "timeline minutes"),
+            priority_duck_db=fx.num(d.get("priority_duck_db", -15.0), -15.0, -60.0, 0.0, "priority ducking"),
+            alert_sound=fx.boolean(d.get("alert_sound", True), True, "alert sound"),
+            alert_popup=fx.boolean(d.get("alert_popup", True), True, "alert pop-up"),
         )
+        cfg.groups = _load_groups(d.get("groups", []), {c.id for c in channels}, warnings)
+        active = clean_text(d.get("active_group", ""), MAX_GROUP_NAME)
+        g = cfg.group(active) if active else None
+        cfg.active_group = g.name if g is not None else ""
         cfg.load_warnings = warnings
         cfg.ensure_colors()
         return cfg
+
+    # ------------------------------------------------------------- channel lists
+    def group(self, name: str) -> Optional[ChannelGroup]:
+        key = (name or "").casefold()
+        for g in self.groups:
+            if g.name.casefold() == key:
+                return g
+        return None
+
+    def active_ids(self) -> Optional[set[str]]:
+        """Ids of the active channel list, or None when all channels are monitored."""
+        g = self.group(self.active_group) if self.active_group else None
+        return set(g.ids) if g is not None else None
+
+    def visible_channels(self) -> list[ChannelConfig]:
+        """Channels shown in the channel panel (the active list, in channel order)."""
+        ids = self.active_ids()
+        return list(self.channels) if ids is None else [c for c in self.channels if c.id in ids]
+
+    def monitored_channels(self) -> list[ChannelConfig]:
+        """Channels that are received right now: enabled and in the active list."""
+        ids = self.active_ids()
+        return [c for c in self.channels if c.enabled and (ids is None or c.id in ids)]
+
+    def groups_of(self, ch_id: str) -> list[str]:
+        return [g.name for g in self.groups if ch_id in g.ids]
+
+    def prune_groups(self) -> None:
+        """Drop ids of channels that no longer exist."""
+        ids = {c.id for c in self.channels}
+        for g in self.groups:
+            g.ids = [i for i in g.ids if i in ids]
 
     def ensure_colors(self) -> None:
         used = {c.color for c in self.channels if c.color}
@@ -358,6 +450,40 @@ class AppConfig:
         if self.recordings_dir:
             return Path(self.recordings_dir)
         return Path.home() / "SDRScanner" / "recordings"
+
+
+def unique_group_name(cfg: AppConfig, wanted: str) -> str:
+    base = clean_text(wanted, MAX_GROUP_NAME) or "List"
+    name, n = base, 2
+    while cfg.group(name) is not None:
+        suffix = f" ({n})"
+        name = base[: MAX_GROUP_NAME - len(suffix)] + suffix
+        n += 1
+    return name
+
+
+def _load_groups(raw: Any, channel_ids: set[str], warnings: list[str]) -> list[ChannelGroup]:
+    groups: list[ChannelGroup] = []
+    if not isinstance(raw, list):
+        if raw:
+            warnings.append("'groups' is not a list; ignored")
+        return groups
+    seen: set[str] = set()
+    for entry in raw[:MAX_GROUPS]:
+        if not isinstance(entry, dict):
+            warnings.append("invalid channel list entry skipped")
+            continue
+        name = clean_text(entry.get("name", ""), MAX_GROUP_NAME)
+        if not name or name.casefold() in seen:
+            warnings.append(f"channel list {name!r} skipped (empty or duplicate name)")
+            continue
+        ids_raw = entry.get("ids", [])
+        ids = [i for i in ids_raw if isinstance(i, str) and i in channel_ids] if isinstance(ids_raw, list) else []
+        seen.add(name.casefold())
+        groups.append(ChannelGroup(name, list(dict.fromkeys(ids))))
+    if isinstance(raw, list) and len(raw) > MAX_GROUPS:
+        warnings.append(f"only the first {MAX_GROUPS} channel lists were loaded")
+    return groups
 
 
 def save_profile(cfg: AppConfig, path: str | os.PathLike) -> None:

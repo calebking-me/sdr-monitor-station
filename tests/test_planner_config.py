@@ -167,3 +167,45 @@ def test_helpers():
     assert snap_ctcss("100") == 100.0 and snap_ctcss(" off ") is None and snap_ctcss(88.6) == 88.5
     with pytest.raises(ValueError):
         snap_ctcss(125.0)
+
+
+# ----------------------------------------------------------------- channel lists, DCS, hold, priority
+
+def test_profile_roundtrip_with_lists_and_new_fields(tmp_path):
+    from sdrscanner.config import ChannelGroup
+    a = ChannelConfig(name="A", frequency=146.52e6, dcs_code="754", dcs_polarity="either", hold_time=3.5,
+                      priority=True, alert=True)
+    b = ChannelConfig(name="B", frequency=146.55e6, ctcss_hz=100.0)
+    cfg = AppConfig(channels=[a, b], groups=[ChannelGroup("Mine", [a.id])], active_group="Mine",
+                    priority_duck_db=-25.0, alert_sound=False)
+    cfg.ensure_colors()
+    p = tmp_path / "p.json"
+    save_profile(cfg, p)
+    back = load_profile(p)
+    assert back.to_dict() == cfg.to_dict()
+    assert [c.name for c in back.monitored_channels()] == ["A"]
+
+
+def test_lists_and_dcs_are_validated(tmp_path):
+    cfg = _load(tmp_path, {
+        "channels": [{"name": "a", "frequency": 1e8, "id": "aa", "dcs_code": "088"},
+                     {"name": "b", "frequency": 1e8, "id": "bb", "dcs_code": "D023I", "ctcss_hz": 100},
+                     {"name": "c", "frequency": 1e8, "id": "cc", "mode": "AM", "dcs_code": "023"}],
+        "groups": [{"name": "<b>X</b>‮", "ids": ["aa", "zz", 5, "aa"]}, {"name": "x"},
+                   "junk", {"name": "Y" * 100, "ids": "notalist"}],
+        "active_group": "nope", "priority_duck_db": 50})
+    a, b, c = cfg.channels
+    assert a.dcs_code is None and (b.dcs_code, b.dcs_polarity, b.ctcss_hz) == ("023", "I", None)
+    assert c.dcs_code is None                                   # AM has no DCS
+    g = cfg.groups[0]
+    assert g.ids == ["aa"] and "‮" not in g.name
+    assert [len(x.ids) for x in cfg.groups] == [1, 0, 0]          # 'junk' entry dropped
+    assert cfg.groups[2].name == "Y" * 40                          # long names truncated
+    assert cfg.active_group == "" and cfg.priority_duck_db == 0
+    assert any("DCS" in w for w in cfg.load_warnings)
+
+
+def test_too_many_lists(tmp_path):
+    from sdrscanner.config import MAX_GROUPS
+    cfg = _load(tmp_path, {"groups": [{"name": f"L{i}", "ids": []} for i in range(MAX_GROUPS + 5)]})
+    assert len(cfg.groups) == MAX_GROUPS

@@ -45,7 +45,8 @@ class ChannelStatus:
     open: bool = False
     carrier: bool = False
     tone: Optional[float] = None
-    state: str = "idle"       # idle | active | out_of_band | disabled | stopped
+    dcs: Optional[str] = None
+    state: str = "idle"       # idle | active | out_of_band | disabled | not_in_list | stopped
 
 
 @dataclass
@@ -75,7 +76,11 @@ class _OpenEvent:
     start: float
     peak: float
     tone: Optional[float]
+    dcs: Optional[str]
     recorder: Optional[WavRecorder]
+    last_open: float = 0.0   # time of the last frame with the squelch open
+    holding: bool = False    # squelch closed, waiting up to hold_time for the signal to return
+    gap: int = 0             # samples of silence to write if it does return
 
 
 class Engine:
@@ -110,6 +115,8 @@ class Engine:
         self._iq_request: Optional[str] = None      # path to start, "" to stop
         self._iq_rec: Optional[IqRecorder] = None
         self.audio: Optional[AudioManager] = None
+        # channel id -> unix time until which the channel is muted (temporary mutes)
+        self.mute_until: dict[str, float] = {}
 
     # ----------------------------------------------------------------- control
     @property
@@ -206,14 +213,15 @@ class Engine:
     # ----------------------------------------------------------------- planning
     def _initial_center(self) -> float:
         r = self.config.radio
-        plan = plan_center(self.config.channels, r.sample_rate, r.auto_center, r.manual_center)
+        plan = plan_center(self.config.monitored_channels(), r.sample_rate, r.auto_center, r.manual_center)
         return plan.center
 
     def _make_plan(self, fs: float, current_center: float, tunable: bool) -> Plan:
         r = self.config.radio
+        monitored = self.config.monitored_channels()       # enabled and in the active list
         if not tunable:
-            return plan_center(self.config.channels, fs, fixed_center=current_center)
-        return plan_center(self.config.channels, fs, r.auto_center, r.manual_center)
+            return plan_center(monitored, fs, fixed_center=current_center)
+        return plan_center(monitored, fs, r.auto_center, r.manual_center)
 
     # ----------------------------------------------------------------- threads
     def _reader_loop(self) -> None:
@@ -331,8 +339,8 @@ class Engine:
             if chz is None or chz.fs != chunk.fs or chz.center != chunk.center:
                 # New tuning: every channel's DSP state starts over.
                 now = time.time()
-                for cid in list(open_events):
-                    self._close_event(cid, now)
+                for cid, ev in list(open_events.items()):
+                    self._close_event(cid, ev.last_open if ev.holding else now)
                 chz = Channelizer(chunk.fs, chunk.center)
                 bank = None
                 self._dirty.set()
@@ -374,18 +382,21 @@ class Engine:
         if tunable and abs(plan.center - chunk.center) > 1:
             self._want_center = plan.center
         channels = list(self.config.channels)
-        enabled = [c for c in channels if c.enabled]
+        enabled = self.config.monitored_channels()
+        monitored_ids = {c.id for c in enabled}
         bank = ChannelBank(chz, enabled, old)
         live = {r.cfg.id: r.key for r in bank.rows}
         now = time.time()
         for cid, ev in list(self._open_events.items()):
             if live.get(cid) != ev.key:      # removed, disabled, or retuned/re-moded
-                self._close_event(cid, now)
+                self._close_event(cid, ev.last_open if ev.holding else now)
         rejected = {c.id for c in bank.rejected}
         status = {}
         for ch in channels:
             if not ch.enabled:
                 status[ch.id] = ChannelStatus(state="disabled")
+            elif ch.id not in monitored_ids:
+                status[ch.id] = ChannelStatus(state="not_in_list")
             elif ch.id in rejected:
                 status[ch.id] = ChannelStatus(state="out_of_band")
             else:
@@ -402,11 +413,15 @@ class Engine:
         C = len(cfgs)
         rec_dir = self.config.effective_recordings_dir()
         frame_dur = chz.frame_seconds
+        hop = chz.hop_c
         open_events = self._open_events
         last = None
         devices = sorted({c.audio_device for c in cfgs})
         dev_rows = {k: np.array([i for i, c in enumerate(cfgs) if c.audio_device == k], dtype=np.int64)
                     for k in devices}
+        now0 = time.time()
+        muted = {cid for cid, until in list(self.mute_until.items()) if until > now0}
+        duck = float(10 ** (self.config.priority_duck_db / 20.0))
         for frame_index, X in chz.frames(x):
             if C == 0:
                 continue
@@ -417,41 +432,54 @@ class Engine:
                 cid = cfg.id
                 is_open = f.open[i]
                 ev = open_events.get(cid)
-                if is_open and ev is None:
-                    rec = None
-                    if cfg.record:
-                        try:
-                            rec = WavRecorder(rec_dir, cfg.name, cfg.frequency, now)
-                        except OSError as e:
-                            self._message(f"Recording failed for {cfg.name}: {e}")
-                    ev = _OpenEvent(rows[i].key, cfg.name, cfg.frequency, cfg.mode, now - frame_dur,
-                                    float(f.rssi[i]), f.tones[i], rec)
-                    open_events[cid] = ev
-                    with self._history_lock:
-                        self.history.append((cid, ev.start, None))
-                elif not is_open and ev is not None:
-                    self._close_event(cid, now)
-                    ev = None
-                if ev is not None:
+                if is_open:
+                    if ev is None:
+                        rec = None
+                        if cfg.record:
+                            try:
+                                rec = WavRecorder(rec_dir, cfg.name, cfg.frequency, now)
+                            except OSError as e:
+                                self._message(f"Recording failed for {cfg.name}: {e}")
+                        ev = _OpenEvent(rows[i].key, cfg.name, cfg.frequency, cfg.mode, now - frame_dur,
+                                        float(f.rssi[i]), f.tones[i], f.dcs[i], rec)
+                        open_events[cid] = ev
+                        with self._history_lock:
+                            self.history.append((cid, ev.start, None))
+                    elif ev.holding:
+                        # The signal came back within the hold time: same transmission.
+                        ev.holding = False
+                        if ev.gap:
+                            self._record(ev, np.zeros(ev.gap, dtype=np.float32), cfg)
+                        ev.gap = 0
+                    ev.last_open = now
                     ev.peak = max(ev.peak, float(f.rssi[i]))
                     if f.tones[i]:
                         ev.tone = f.tones[i]
-                    if ev.recorder is not None:
-                        try:
-                            ev.recorder.write(f.audio[i])
-                        except OSError as e:
-                            self._message(f"Recording stopped for {cfg.name}: {e}")
-                            ev.recorder.close()
-                            ev.recorder = None
+                    if f.dcs[i]:
+                        ev.dcs = f.dcs[i]
+                    self._record(ev, f.audio[i], cfg)
+                elif ev is not None:
+                    if not ev.holding:
+                        ev.holding = True
+                        ev.gap = 0
+                        self._record(ev, f.audio[i], cfg)       # the squelch fade-out
+                    else:
+                        ev.gap += hop
+                    if now - ev.last_open >= cfg.hold_time:
+                        self._close_event(cid, ev.last_open + frame_dur)
 
             if self.audio and self.audio.enabled:
                 any_solo = any(c.solo for c in cfgs)
+                audible = [f.open[i] and not c.mute and c.id not in muted and (c.solo or not any_solo)
+                           and c.volume > 0 for i, c in enumerate(cfgs)]
+                priority_on = any(audible[i] and cfgs[i].priority for i in range(C))
                 gl = np.zeros(C, dtype=np.float32)
                 gr = np.zeros(C, dtype=np.float32)
                 for i, c in enumerate(cfgs):
-                    if f.open[i] and not c.mute and (c.solo or not any_solo) and c.volume > 0:
+                    if audible[i]:
+                        g = c.volume * (duck if priority_on and not c.priority else 1.0)
                         left, right = pan_gains(c.pan)
-                        gl[i], gr[i] = c.volume * left, c.volume * right
+                        gl[i], gr[i] = g * left, g * right
                 for key in devices:
                     idx = dev_rows[key]
                     a = f.audio[idx]
@@ -469,30 +497,42 @@ class Engine:
                         continue
                     st.rssi_db, st.noise_db = float(last.rssi[i]), float(last.noise[i])
                     st.open, st.carrier, st.tone = last.open[i], last.carrier[i], last.tones[i]
+                    st.dcs = last.dcs[i]
                     st.state = "active" if last.open[i] else "idle"
 
-    def _close_event(self, cid: str, now: float) -> None:
+    def _record(self, ev: _OpenEvent, audio: np.ndarray, cfg) -> None:
+        if ev.recorder is None:
+            return
+        try:
+            ev.recorder.write(audio)
+        except OSError as e:
+            self._message(f"Recording stopped for {cfg.name}: {e}")
+            ev.recorder.close()
+            ev.recorder = None
+
+    def _close_event(self, cid: str, end: float) -> None:
         ev = self._open_events.pop(cid, None)
         if ev is None:
             return
+        end = max(ev.start, min(end, time.time()))
         path = ""
         if ev.recorder is not None:
             ev.recorder.close()
             path = str(ev.recorder.path)
-        event = ActivityEvent(cid, ev.name, ev.frequency, ev.start, now, ev.peak, ev.tone, path, ev.mode)
+        event = ActivityEvent(cid, ev.name, ev.frequency, ev.start, end, ev.peak, ev.tone, path, ev.mode, ev.dcs)
         with self._lock:
             self._events.append(event)
         with self._history_lock:
             for i in range(len(self.history) - 1, -1, -1):
                 h = self.history[i]
                 if h[0] == cid and h[2] is None:
-                    self.history[i] = (cid, h[1], now)
+                    self.history[i] = (cid, h[1], end)
                     break
 
     def _close_all_events(self) -> None:
         now = time.time()
-        for cid in list(self._open_events):
-            self._close_event(cid, now)
+        for cid, ev in list(self._open_events.items()):
+            self._close_event(cid, ev.last_open if ev.holding else now)
         with self._lock:
             for st in self._status.values():
                 st.open = False

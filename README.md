@@ -2,10 +2,12 @@
 
 Monitor many FM and AM voice channels **at the same time** with a single RTL-SDR
 dongle. Every channel inside the dongle's capture bandwidth (about 2 MHz at
-2.4 MS/s) is demodulated in parallel. Each channel has its own squelch, CTCSS
-tone, volume, left/right fade and audio output device.
+2.4 MS/s) is demodulated in parallel. Each channel has its own squelch, CTCSS or
+DCS tone squelch, volume, left/right fade and audio output device.
 
-![Screenshot: spectrum, waterfall and channel strips playing the synthetic demo recording](docs/screenshot.png)
+![Screenshot: the demo recording with channel lists, a priority channel and last-heard times](docs/screenshot.png)
+
+![Screenshot: all 40 CB channels (AM) in the compact view](docs/screenshot-cb.png)
 
 - **FM and AM.** Narrow (12.5 kHz) and wide (25 kHz) FM for land-mobile,
   amateur, marine, FRS/GMRS and MURS. AM for aviation and CB, with
@@ -19,14 +21,29 @@ tone, volume, left/right fade and audio output device.
 - **Spectrum + waterfall** of the whole captured band, with mouse-wheel zoom,
   peak hold and selectable colour maps. Each channel is marked and lights up
   while its squelch is open. Double-click to add a channel; right-click for more.
-- **Channel strips** show a live signal meter, activity LED and detected CTCSS
-  tone, with squelch, volume, pan, mute, solo and record controls. A compact
-  one-line layout is available for long lists.
+- **CTCSS and DCS.** Tone squelch on all 50 CTCSS tones and all 104 DCS codes,
+  in normal or inverted polarity. The tone or code each FM channel is using is
+  shown live, logged, and can be adopted as its squelch with one click.
+- **Channel lists.** Group channels ("Local", "Marine", "CB"…) and switch between
+  them from the toolbar or with Ctrl+1…9. Only the chosen list is received, and
+  the dongle retunes for it.
+- **Channel strips** show a live signal meter, activity LED, detected tone/code
+  and when the channel was last heard, with squelch, volume, pan, mute, solo and
+  record controls. A compact one-line layout is available for long lists.
+- **Organise channels in bulk.** Select several, drag them to reorder, or **edit
+  any setting of many channels at once**.
+- **Priority channels** turn the others down while they are active. **Alert
+  channels** pop up a notification. **Temporary mute** silences a channel for
+  5, 15 or 60 minutes.
+- **Transmission hold.** A short drop (such as a repeater's morse ID) stays in
+  one recording and one log entry instead of creating a new file each time.
 - **Activity timeline** showing when each channel was active, and an
-  **activity log** that exports to CSV.
+  **activity log** (with CTCSS/DCS) that exports to CSV. Double-click a log row
+  to play its recording.
 - **View options:** dark/light theme; spectrum above or beside the channels;
-  show/hide any panel; a **borderless window** mode, full screen, and
-  always-on-top (for a dedicated monitor).
+  show/hide any panel; a **streamlined view** without the menu bar, toolbar and
+  tabs; a **borderless window** mode, full screen, and always-on-top (for a
+  dedicated monitor).
 - **Recording:** per-transmission WAV files, and raw IQ (SigMF) for playback.
 - **Sources:** USB dongle, rtl_tcp, or IQ file playback (no hardware needed).
 
@@ -137,8 +154,9 @@ You can also play any recording with `python -m sdrscanner --iq capture.sigmf-me
    rate, gain/AGC, and PPM correction.
 2. **Add channels** in any of these ways:
    - **Add channel…** (Ctrl+N), or double-click the spectrum. Set the name,
-     frequency, mode (FM/AM), bandwidth, squelch, hysteresis, hang time, CTCSS
-     tone, de-emphasis, volume, pan, output device and recording.
+     frequency, mode (FM/AM), bandwidth, squelch, hysteresis, hang time, tone
+     squelch (CTCSS or DCS), de-emphasis, volume, pan, output device, priority,
+     alert, recording, transmission hold and channel lists.
    - **Channels → Add from preset…** (Ctrl+P). See [Preset lists](#preset-lists).
    - **Channels → Import CSV…** (Ctrl+I). See
      [Importing channels from CSV](#importing-channels-from-csv).
@@ -149,6 +167,54 @@ warning. You get a warning when channels don't fit in the capture bandwidth or
 sit on top of the DC spike. The **Channels** menu can also enable or disable
 everything, sort by frequency, set every squelch at once, remove all channels,
 or export the list to CSV.
+
+### Channel lists
+
+A channel list is a named group of channels: "Public safety", "Marine",
+"CB", "Ham repeaters" and so on. A channel can be in any number of lists. Pick
+the list to receive with **Monitor:** in the toolbar, Ctrl+1 … Ctrl+9, or
+Ctrl+` for all channels.
+
+- Only the channels in that list are received and shown. The dongle retunes for
+  them, so switching from a 156 MHz marine list to a 27 MHz CB list just works.
+- Manage lists with **Channels → Manage channel lists…** (Ctrl+L): new, rename,
+  duplicate, delete, and tick the channels that belong to each.
+- Add channels to lists from a channel's right-click menu, the channel dialog,
+  or the bulk editor.
+- When adding a preset or importing a CSV you can put the new channels straight
+  into a new list and start monitoring it.
+- New channels added while a list is active join that list.
+- Lists are saved in the profile and exported in the CSV `lists` column.
+
+### Selecting, reordering and editing several channels
+
+- **Select** channels by clicking a strip. Ctrl+click adds or removes one, and
+  Shift+click selects a range. Ctrl+A selects all.
+- **Reorder** by dragging strips (the whole selection moves), with Alt+Up /
+  Alt+Down, or with the right-click menu (move up, down, to top, to bottom).
+  Order is kept per profile and used by the timeline and CSV export. When a list
+  is active, only its channels move; the others keep their places.
+- **Edit several at once:** Ctrl+E (or right-click → *Edit N channels
+  together…*) opens the bulk editor. Tick the settings to change, such as
+  squelch (a fixed level or *noise floor + N dB*), tone squelch, bandwidth,
+  mode, hold time, volume, pan, mute, record, priority, alert, output device or
+  list membership. Only the ticked settings change, and only on the ticked
+  channels. FM-only settings skip AM channels.
+- Right-click also offers duplicate, delete, *set squelch from noise floor*,
+  temporary mute, and *use detected tone/code as tone squelch*.
+
+### Priority, alerts and temporary mute
+
+- **Priority** (★): while a priority channel is active, every other channel is
+  turned down. The level is set in *Radio settings → Priority and alerts*
+  (default −15 dB; −60 dB is practically mute).
+- **Alert** (⚑): when the channel becomes active you get a desktop notification
+  and/or the system alert sound, at most once every 15 seconds per channel. The
+  alert is also written to the Messages tab.
+- **Temporary mute:** right-click → *Mute for* 5, 15 or 60 minutes. The M
+  button shows `M⏱` until the mute ends by itself.
+- **Last heard:** each strip shows when the channel last had activity and how
+  many transmissions it has had this session. Hover for total airtime.
 
 ### Preset lists
 
@@ -190,8 +256,12 @@ CB 19,27.185,AM,,,,,,yes
 | `name` / `label` / `alpha_tag` | Defaults to the frequency |
 | `mode` | `FM`/`NFM` or `AM`. WFM and digital modes are rejected. |
 | `bandwidth` / `bandwidth_khz` / `bw` | Defaults: FM 12.5 kHz (`NFM` → 12.5 kHz), AM 8 kHz |
-| `squelch_db`, `hysteresis_db`, `hang_time_s` | dBFS, dB, seconds |
+| `squelch_db`, `hysteresis_db`, `hang_time_s`, `hold_time_s` | dBFS, dB, seconds, seconds |
 | `ctcss_hz` / `tone` / `pl` | Standard tone in Hz, or `off` (FM only) |
+| `dcs` / `dtcs` / `dpl` | DCS code such as `023`, `D023N`, `754I` (FM only; wins over CTCSS) |
+| `dcs_polarity` | `N`, `I` (or `R`) or `either`; overrides a suffix on the code |
+| `priority`, `alert` | yes/no |
+| `lists` | Channel lists to put the channel in, separated by `\|` (e.g. `Local\|Repeaters`) |
 | `deemphasis_us` | `750` (default) or `0`/`off` |
 | `volume_pct`, `pan_pct` | 0–200 %, −100 (left) … +100 (right) |
 | `enabled`, `record` | yes/no, true/false, 1/0 |
@@ -199,8 +269,11 @@ CB 19,27.185,AM,,,,,,yes
 
 **CHIRP exports** are recognised automatically. For those, `Frequency` is the
 receive frequency, `Mode` FM = 25 kHz and NFM = 12.5 kHz, and `Tone` = TSQL uses
-`cToneFreq` as tone squelch. Plain `Tone` (transmit tone only) and DCS fall back
-to carrier squelch, and `Skip` = S imports the channel disabled. Rows that can't
+`cToneFreq` as tone squelch. `Tone` = DTCS uses `DtcsCode` as DCS squelch, with
+the receive polarity taken from the second letter of `DtcsPolarity` (R =
+inverted). Cross mode uses the receive half of `CrossMode` (`…->Tone` or
+`…->DTCS`, with `RxDtcsCode`). Plain `Tone` (transmit tone only) falls back to
+carrier squelch, and `Skip` = S imports the channel disabled. Rows that can't
 be used are listed with the reason and skipped. **File → Export channels to
 CSV…** writes the same format, so lists round-trip and can be edited in a
 spreadsheet.
@@ -212,6 +285,7 @@ spreadsheet.
 | Theme | Dark or light |
 | Layout | Spectrum above the channels, or side by side (good for wide screens) |
 | Show spectrum / waterfall / channel panel / toolbar / status bar | Hide what you don't need (one panel always stays visible) |
+| Streamlined view (Ctrl+M) | Hides the menu bar, toolbar and panel tabs for a clean second-monitor display |
 | Compact channel strips | One line per channel, for long lists such as the 40 CB channels |
 | Channel labels | Names on the spectrum for all channels, active channels only, or none |
 | Waterfall colours | Inferno, magma, plasma, viridis, cividis, turbo, grayscale |
@@ -225,9 +299,18 @@ spreadsheet.
 station display on a second monitor. The menu bar acts as the title bar: drag
 its empty area to move the window, and double-click it to maximise. Minimise,
 maximise and close buttons sit at its right end. Drag any window edge or corner
-to resize. View settings are saved per user (`view.json` next to the last
-profile), separately from channel profiles, so sharing a profile doesn't change
-anyone's layout.
+to resize.
+
+**Streamlined view** (Ctrl+M, or right-click the spectrum) hides the menu bar,
+toolbar and the tab bar above the channel panel. Combined with borderless or
+full screen it leaves just the spectrum, waterfall and channels. Everything
+stays reachable: Ctrl+M or right-click brings the bars back, and other
+shortcuts keep working. A borderless window can be moved by **Alt+dragging**
+anywhere in it.
+
+View settings are saved per user (`view.json` next to the last profile),
+separately from channel profiles, so sharing a profile doesn't change anyone's
+layout.
 
 ### How the centre frequency is chosen
 
@@ -258,6 +341,17 @@ automatically. For IQ file playback, the centre is fixed by the recording.
   The detected tone is shown on the strip for every FM channel either way, which
   helps you find out what tone a channel uses. The tone must be confirmed first,
   so a tone-squelched channel opens about 0.5 s after the carrier appears.
+- **DCS** (FM only): when set, the channel only opens for that code. Every
+  standard code is supported, and the detected code is shown on the strip
+  (e.g. `♪ DCS 023N`) and logged. Polarity can be *Normal*, *Inverted* or
+  *Either*. Several codes describe the same signal (023 = 340 = 766, and 023
+  inverted = 047 normal), so either name works. Detection takes about 0.5 s
+  after key-up.
+- **Transmission hold** (default 2 s): after the squelch closes, the recording
+  and the log entry stay open this long. If the signal returns, for example
+  between the dots and dashes of a repeater's morse ID or after a short fade, it
+  continues the same WAV file (the gap is written as silence) and the same log
+  entry. Set it to 0 to split at every drop.
 
 ### Audio routing
 
@@ -293,9 +387,11 @@ use it on a network you trust.
 ### Keyboard shortcuts
 
 F5 start/stop · Ctrl+N add channel · Ctrl+P presets · Ctrl+I import CSV ·
-Ctrl+O/Ctrl+S open/save profile · Ctrl+B borderless · F11 full screen
-(Esc leaves) · Ctrl+= zoom to channels · Ctrl+0 full band. They're also listed
-under *Help → Keyboard shortcuts*.
+Ctrl+O/Ctrl+S open/save profile · Ctrl+L channel lists · Ctrl+1…9 / Ctrl+` monitor a
+list / all · Ctrl+A select all · Ctrl+E edit selected · Alt+Up/Down move · Del delete
+selected · Ctrl+M streamlined view · Ctrl+B borderless · F11 full screen (Esc leaves) ·
+Alt+drag move a borderless window · Ctrl+= zoom to channels · Ctrl+0 full band.
+They're also listed under *Help → Keyboard shortcuts*.
 
 ---
 
@@ -333,9 +429,21 @@ under *Help → Keyboard shortcuts*.
 - **AM**: envelope detector divided by a tracked carrier level. That AGC makes
   the output level depend only on modulation depth, not signal strength. Then
   the same voice band-pass.
-- **CTCSS**: the discriminator output is low-passed and decimated to 3 kHz.
-  The 51 standard tones are measured over a 0.5 s window, and a tone is accepted
-  only when it dominates the sub-audio band in several estimates in a row.
+- **CTCSS**: the discriminator output is low-passed and decimated to 3 kHz into
+  a ring buffer. The 51 standard tones are measured over a 0.5 s window, and a
+  tone is accepted only when it dominates the sub-audio band in several
+  estimates in a row.
+- **DCS** (`sdrscanner/dcs.py`): a code word is a 23-bit Golay (23,12) word: the
+  9-bit code with the fixed bits `100`, plus 11 check bits from generator 0xC75
+  (DCS 023 = 0x763813). It is sent continuously, least significant bit first,
+  at 134.4 bit/s.
+  - The detector slices the last 0.75 s of the sub-audio stream into bits at six
+    clock phases and looks up every 23-bit window in a sorted table of all 2392
+    rotations of the 104 standard codes. This is vectorised across channels.
+  - A clean stream matches on every window, so a code is reported after at
+    least 23 agreeing windows in two consecutive checks. Noise matches about
+    0.03% of windows, so false codes are effectively impossible.
+  - Polarity convention: *normal* means a 1 bit raises the carrier frequency.
 - **Threads**: the USB/network/file reader, the DSP, and each PortAudio
   callback run off the GUI thread. The GUI polls a snapshot 25 times a second
   and never blocks. If the DSP falls behind, the oldest chunks are dropped and
@@ -354,9 +462,12 @@ people, so they are treated as untrusted input:
 - **Validation.** Every number must be finite and is clamped to a sane range.
   Absurd IQ sample rates are refused, so a crafted file can't trigger a huge
   allocation.
-- **Text.** Names and other strings are length-limited, and control and bidi
-  characters are stripped.
-- **Malformed files** produce an error message, never a crash.
+- **Text.** Names and other strings (channel names, list names) are
+  length-limited, and control and bidi characters are stripped. DCS codes must
+  be valid octal codes. Lists may only reference existing channels, and there
+  are at most 64 lists.
+- **Malformed files** produce an error message, never a crash. Drag-and-drop
+  data is validated against the channels on screen.
 - **No HTML.** User-supplied text (channel names, device names, file names) is
   never rendered as HTML in the interface.
 - **Exported CSVs** neutralise spreadsheet formula injection: cells starting
@@ -385,20 +496,28 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-The suite has 164 tests:
+The suite has 220 tests:
 
 - **DSP**: tone recovery at every supported sample rate, FM and AM including
   AGC, mixed multi-channel banks, seamless bank rebuilds, adjacent-channel
   rejection, squelch and CTCSS.
+- **DCS**: the published 023 codeword, table structure, documented inversion
+  and rotation aliases, parsing, decoding in noise, no false codes, and tone
+  squelch with right, wrong and either polarity.
 - **Planner and config validation**, including fuzzed and hostile profiles.
 - **CSV import/export**, including CHIRP files and a fuzzer.
 - **Presets**.
 - **Every IQ file format**, including a corrupt-WAV fuzzer.
 - **rtl_tcp** against a fake server, including reconnects.
 - **Engine behaviour** under live channel edits and retuning, audio routing
-  (pan, mute, solo), IQ record and playback, and restarts.
+  (pan, mute, solo), priority ducking, temporary mutes, channel lists,
+  transmission hold (merging and splitting), DCS end to end, IQ record and
+  playback, and restarts.
 - **Security regressions**.
-- **Headless GUI tests**: window modes, view options, picker, HTML escaping.
+- **Headless GUI tests**: window modes, the streamlined view and Alt+drag, view
+  options, picker, selection, drag reordering (including within a list), bulk
+  edit, channel lists, alerts, learning tones, last heard, playing recordings
+  from the log, and HTML escaping.
 
 On a headless Linux box, run with `QT_QPA_PLATFORM=offscreen`.
 
@@ -429,7 +548,7 @@ does the same on every push and pull request. It runs the test suite on
 Windows, builds the exe, runs its self-test, and uploads the zip as an
 artifact.
 
-To publish a GitHub release with the zip, either push a tag such as `v0.1.0`,
+To publish a GitHub release with the zip, either push a tag such as `v0.2.0`,
 or run the workflow manually on `main` (*Actions → Windows build → Run
 workflow*) with *release_tag* set. A manual run creates the tag for you. In both
 cases the tag must match the app version. When you bump the version, update
@@ -472,5 +591,8 @@ packaging/       PyInstaller spec, launcher, icon, Windows build script
 | Nothing on CB / 27 MHz | Your tuner must reach 27 MHz (R820T/R828D do; E4000 starts at about 52 MHz). Use a suitable HF/CB antenna. |
 | Choppy audio, "dropped" counter rising | Lower the sample rate, use fewer channels, or close CPU-heavy programs. Check the *DSP load* figure in the status bar. |
 | Image of a strong signal mirrored around the centre | This is RTL-SDR IQ imbalance. Lower the gain, or move the channel by changing the manual centre. |
-| Borderless window is hard to grab | Drag the empty part of the menu bar, or press Ctrl+B to get the normal frame back. |
+| Borderless window is hard to grab | Drag the empty part of the menu bar, Alt+drag anywhere, or press Ctrl+B to get the normal frame back. |
+| The menus have disappeared | Streamlined view is on: press Ctrl+M or right-click the spectrum. |
+| A known DCS channel never opens | Set its polarity to *Either polarity*. Some radios invert the code. Also check the strip's detected code (`♪ DCS …`). |
+| One transmission makes several recordings | Raise the channel's *Transmission hold* (bulk editor → *Transmission hold* for many channels at once). |
 | "Audio disabled: PortAudio library not found" (Linux) | `sudo apt install libportaudio2` |

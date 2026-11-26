@@ -31,6 +31,7 @@ class ViewSettings:
     show_toolbar: bool = True
     show_statusbar: bool = True
     compact_strips: bool = False
+    streamlined: bool = False           # hide menu bar, toolbar and panel tabs (second-monitor view)
     channel_labels: str = "all"
     colormap: str = "inferno"
     fft_size: int = 2048
@@ -69,7 +70,7 @@ class ViewSettings:
         if self.level_max <= self.level_min + 5:
             self.level_max = self.level_min + 5
         for f in ("always_on_top", "show_spectrum", "show_waterfall", "show_panel", "show_toolbar",
-                  "show_statusbar", "compact_strips", "auto_levels", "peak_hold"):
+                  "show_statusbar", "compact_strips", "streamlined", "auto_levels", "peak_hold"):
             setattr(self, f, bool(getattr(self, f)))
         if not (self.show_spectrum or self.show_waterfall or self.show_panel):
             self.show_panel = True

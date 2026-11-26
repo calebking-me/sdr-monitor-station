@@ -97,6 +97,7 @@ class SpectrumView(QWidget):
         self._auto_levels = view.auto_levels
         self._manual_levels = (view.level_min, view.level_max)
         self._peak_on = view.peak_hold
+        self.extra_actions: list = []          # added to the right-click menu by the main window
 
         self.spec_plot = pg.PlotWidget()
         self.spec_plot.setLabel("left", "dBFS")
@@ -359,4 +360,8 @@ class SpectrumView(QWidget):
             menu.addAction("Show full band", self.zoom_full)
             if self._peak_on:
                 menu.addAction("Reset peak hold", self.reset_peak)
+            if self.extra_actions:
+                menu.addSeparator()
+                for a in self.extra_actions:
+                    menu.addAction(a)
             menu.popup(ev.screenPos().toPoint())

@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 from scipy import signal
 
+from .. import dcs as dcs_codes
 from ..config import MODE_AM, MODE_FM, AppConfig, ChannelConfig, RadioConfig, SOURCE_FILE, save_profile
 from ..dsp import complex_to_u8
 from ..sources import write_sigmf_meta, sigmf_base
@@ -36,6 +37,25 @@ class SynthChannel:
     pitch: float = 140.0
     mode: str = MODE_FM
     am_depth: float = 0.8          # AM modulation index at full voice level
+    dcs: str | None = None         # DCS code (e.g. "023") sent under the voice (FM only)
+    dcs_inverted: bool = False
+
+
+def dcs_waveform(code: str, inverted: bool, t: np.ndarray, level: float = 0.2) -> np.ndarray:
+    """Continuous DCS NRZ at 134.4 bit/s with smoothed transitions, as a function of absolute time.
+
+    `level` is the deviation relative to the channel's nominal deviation (0.2 = 500 Hz on 12.5 kHz FM).
+    Normal polarity: a 1 bit raises the carrier frequency.
+    """
+    bits = dcs_codes.stream_bits(int(code, 8), inverted).astype(np.float64) * 2 - 1
+    pos = t * dcs_codes.BIT_RATE
+    k = np.floor(pos).astype(np.int64)
+    frac = pos - k
+    cur = bits[k % dcs_codes.WORD_BITS]
+    prev = bits[(k - 1) % dcs_codes.WORD_BITS]
+    ramp = np.clip(frac / 0.25, 0.0, 1.0)                 # 25 % of a bit, raised-cosine
+    w = 0.5 - 0.5 * np.cos(np.pi * ramp)
+    return level * (prev + (cur - prev) * w)
 
 
 def default_channels(seconds: float, rng: np.random.Generator) -> list[SynthChannel]:
@@ -47,6 +67,7 @@ def default_channels(seconds: float, rng: np.random.Generator) -> list[SynthChan
         SynthChannel("Repeater out", 437_500, -55, ctcss=88.5, pitch=135),
         SynthChannel("Wideband 25k", 662_500, -42, deviation=5_000, pitch=150),
         SynthChannel("AM test", 300_000, -45, pitch=125, mode=MODE_AM),
+        SynthChannel("DCS 023", -850_000, -42, pitch=140, dcs="023"),
     ]
     for i, c in enumerate(chans):
         t = 1.0 + i * 1.3
@@ -107,6 +128,8 @@ def generate(path: str, seconds: float = 60.0, center: float = 460_000_000.0,
                 audio = 0.8 * voice_like(ta, c.pitch, rng)
                 if c.ctcss and c.mode == MODE_FM:
                     audio = 0.85 * audio + 0.15 * np.sin(2 * np.pi * c.ctcss * ta)
+                elif c.dcs and c.mode == MODE_FM:
+                    audio = 0.8 * audio + dcs_waveform(c.dcs, c.dcs_inverted, ta)
                 audio *= on_a
                 a = np.interp(t, ta, audio)
                 on = np.interp(t, ta, on_a.astype(float)) > 0.5
@@ -127,15 +150,17 @@ def generate(path: str, seconds: float = 60.0, center: float = 460_000_000.0,
 def make_profile(data_path: Path, chans: list[SynthChannel], center: float, fs: float) -> AppConfig:
     cfg = AppConfig(radio=RadioConfig(source=SOURCE_FILE, file_path=str(data_path.resolve()),
                                       file_center=center, file_rate=fs, file_loop=True))
-    pans = [-0.8, 0.8, 0.0, -0.4, 0.4, 0.0, 0.6]
+    pans = [-0.8, 0.8, 0.0, -0.4, 0.4, 0.0, 0.6, -0.6]
     for i, c in enumerate(chans):
         if c.mode == MODE_AM:
             bw = 8_000.0
         else:
             bw = 12_500.0 if c.deviation <= 2_500 else 25_000.0
+        fm = c.mode == MODE_FM
         cfg.channels.append(ChannelConfig(
             name=c.name, frequency=center + c.offset, mode=c.mode, bandwidth=bw,
-            squelch_db=-60.0, ctcss_hz=c.ctcss if c.mode == MODE_FM else None,
+            squelch_db=-60.0, ctcss_hz=c.ctcss if fm and not c.dcs else None,
+            dcs_code=c.dcs if fm else None, dcs_polarity="I" if c.dcs_inverted else "N",
             pan=pans[i % len(pans)]))
     cfg.ensure_colors()
     return cfg

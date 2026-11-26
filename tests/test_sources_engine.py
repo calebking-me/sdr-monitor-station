@@ -117,6 +117,7 @@ def test_engine_end_to_end_file(tmp_path):
     cfg.recordings_dir = str(tmp_path / "rec")
     cfg.channels[0].record = True
     cfg.channels[0].hang_time = 0.3
+    cfg.channels[0].hold_time = 0.0          # keep the two bursts separate (see test_engine hold tests)
     # Wrong tone: should never open.
     cfg.channels.append(ChannelConfig(name="A wrong tone", frequency=center - 500_000, squelch_db=-60, ctcss_hz=123.0))
     eng = Engine(cfg)
