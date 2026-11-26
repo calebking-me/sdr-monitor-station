@@ -1,6 +1,7 @@
 """GUI tests for selection, reordering, bulk edit, channel lists, streamlined view and alerts."""
 
 import time
+from pathlib import Path
 
 import pytest
 
@@ -245,7 +246,8 @@ def test_log_double_click_opens_recording(window, tmp_path, monkeypatch):
     t = time.time()
     win._add_event(ActivityEvent("id", "A", 1e8, t - 1, t, -40.0, None, str(rec)))
     win._log_double_clicked(0, 3)
-    assert opened == [str(rec)]
+    # Compare as paths: on Windows QUrl.toLocalFile() uses '/' separators.
+    assert len(opened) == 1 and Path(opened[0]) == rec
     win._add_event(ActivityEvent("id", "A", 1e8, t - 1, t, -40.0, None, ""))
     win._log_double_clicked(0, 3)
     assert len(opened) == 1
