@@ -42,7 +42,20 @@ def _dsp() -> str:
     level = float(np.std(y) * np.sqrt(2))
     if not 0.25 < level < 0.35:
         raise RuntimeError(f"AM demodulator level wrong: {level:.3f}")
-    return f"FM 1 kHz test tone SINAD {sinad:.1f} dB; AM level {level:.2f} (expected 0.30)"
+    from .dsp import ChannelBank
+    from .tools.gen_iq import dcs_waveform
+    t = np.arange(int(fs * 1.6)) / fs
+    dx = (0.05 * np.exp(1j * 2 * np.pi * np.cumsum(off + 2500 * dcs_waveform("023", False, t)) / fs)
+          ).astype(np.complex64)
+    chz = Channelizer(fs, 0)
+    bank = ChannelBank(chz, [ChannelConfig(frequency=off, squelch_db=-60)])
+    code = None
+    for i, X in chz.frames(dx):
+        code = bank.process(X, i).dcs[0] or code
+    if code != "023N":
+        raise RuntimeError(f"DCS decoder returned {code!r} for DCS 023")
+    return (f"FM 1 kHz test tone SINAD {sinad:.1f} dB; AM level {level:.2f} (expected 0.30); "
+            f"DCS 023 decoded")
 
 
 def _audio() -> str:

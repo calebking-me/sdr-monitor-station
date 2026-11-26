@@ -8,11 +8,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QHBoxLayout, QHeaderView, QLabel, QPlainTextEdit, QPushButton, QTableWidget,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QTableWidget,
     QTableWidgetItem, QVBoxLayout,
 )
 
-from ..config import MAX_CHANNELS, SOURCE_FILE, AppConfig, ChannelConfig
+from ..config import MAX_CHANNELS, MAX_GROUP_NAME, SOURCE_FILE, AppConfig, ChannelConfig, clean_text
 from ..planner import plan_center, usable_half_span
 from ..presets import PRESETS
 from . import theme
@@ -26,7 +26,7 @@ class ChannelPickerDialog(QDialog):
 
     def __init__(self, config: AppConfig, parent=None, *, title: str = "Add channels",
                  candidates: Optional[list[ChannelConfig]] = None, use_presets: bool = False,
-                 source_text: str = "", problems: Optional[list[str]] = None):
+                 source_text: str = "", problems: Optional[list[str]] = None, list_name: str = ""):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(820, 620)
@@ -96,6 +96,22 @@ class ChannelPickerDialog(QDialog):
         row.addWidget(self.replace)
         lay.addLayout(row)
 
+        row = QHBoxLayout()
+        self.make_list = QCheckBox("Put them in a new channel list:")
+        self.make_list.setChecked(use_presets)
+        self.list_name = QLineEdit(list_name)
+        self.list_name.setMaxLength(MAX_GROUP_NAME)
+        self.monitor_list = QCheckBox("and monitor that list now")
+        self.monitor_list.setChecked(use_presets)
+        self.make_list.toggled.connect(self.list_name.setEnabled)
+        self.make_list.toggled.connect(self.monitor_list.setEnabled)
+        self.list_name.setEnabled(use_presets)
+        self.monitor_list.setEnabled(use_presets)
+        row.addWidget(self.make_list)
+        row.addWidget(self.list_name, 1)
+        row.addWidget(self.monitor_list)
+        lay.addLayout(row)
+
         self.summary = QLabel()
         self.summary.setTextFormat(Qt.PlainText)
         self.summary.setWordWrap(True)
@@ -115,6 +131,7 @@ class ChannelPickerDialog(QDialog):
         key = self.preset_combo.currentData()
         preset = next(p for p in PRESETS if p.key == key)
         self.preset_info.setText(preset.description)
+        self.list_name.setText(preset.name.split(" (")[0])
         self.candidates = preset.make_channels(self.preset_squelch.value())
         self._populate()
 
@@ -169,7 +186,7 @@ class ChannelPickerDialog(QDialog):
 
     def _plan(self, rows: list[int]):
         r = self.config.radio
-        base = [] if self.replace.isChecked() else [c for c in self.config.channels if c.enabled]
+        base = [] if self.replace.isChecked() else self.config.monitored_channels()
         chans = base + [self.candidates[i] for i in rows]
         if not chans:
             return None
@@ -224,6 +241,12 @@ class ChannelPickerDialog(QDialog):
 
     def replace_existing(self) -> bool:
         return self.replace.isChecked()
+
+    def new_list(self) -> tuple[str, bool]:
+        """(name of a channel list to create for the added channels or '', monitor it now?)."""
+        if not self.make_list.isChecked():
+            return "", False
+        return clean_text(self.list_name.text(), MAX_GROUP_NAME) or "Imported", self.monitor_list.isChecked()
 
 
 def describe_import(path: str, fmt: str, n: int, rows: int) -> str:

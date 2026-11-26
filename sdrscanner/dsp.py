@@ -24,6 +24,7 @@ import numpy as np
 import scipy.fft as sfft
 from scipy import signal
 
+from . import dcs
 from .config import CTCSS_TONES, MODE_AM, MODE_FM  # noqa: F401  (CTCSS_TONES re-exported)
 
 AUDIO_RATE = 48_000
@@ -145,7 +146,11 @@ class _Row:
     tone: Optional[float] = None
     candidate: Optional[float] = None
     streak: int = 0
-    filled: int = 0
+    filled: int = 0                      # samples in the sub-audio ring buffer
+    dcs_class: Optional[int] = None      # confirmed DCS class (see dcs.py)
+    dcs_candidate: Optional[int] = None
+    dcs_streak: int = 0
+    dcs_miss: int = 0
 
 
 @dataclass
@@ -156,6 +161,7 @@ class BankFrame:
     open: list[bool]
     carrier: list[bool]
     tones: list[Optional[float]]
+    dcs: list[Optional[str]] = field(default_factory=list)    # detected DCS code, e.g. "023N"
 
 
 class ChannelBank:
@@ -166,6 +172,11 @@ class ChannelBank:
     CT_CLOSE_RATIO = 0.2
     CT_CONFIRM = 3           # consecutive agreeing estimates (~0.25 s) before reporting a tone
     CT_EVERY = 4             # evaluate tones every 4th frame (~16 Hz)
+    DCS_WINDOW_S = 0.75      # ~100 bits = 4 code words at 134.4 bit/s
+    DCS_PHASES = 6           # bit-clock phases tried per evaluation
+    DCS_EVERY = 8            # evaluate DCS every 8th frame (~8 Hz)
+    DCS_MIN_HITS = 23        # a clean stream matches on every 23-bit window
+    DCS_DOMINANCE = 0.8
 
     def __init__(self, chz: Channelizer, cfgs: Sequence[Any], previous: Optional["ChannelBank"] = None):
         self.chz = chz
@@ -228,7 +239,18 @@ class ChannelBank:
         self.ct_sos = signal.butter(4, 270.0, fs=rate, output="sos")
         self.ct_zi = np.zeros((self.ct_sos.shape[0], C, 2))
         self.ct_n = int(self.CT_WINDOW_S * ct_rate)
-        self.ct_hist = np.zeros((C, self.ct_n))
+        self.dcs_n = int(self.DCS_WINDOW_S * ct_rate)
+        # One ring buffer of the low-passed, decimated discriminator output feeds both
+        # the CTCSS (last 0.5 s) and DCS (last 0.75 s) detectors.
+        self.ring_n = max(self.ct_n, self.dcs_n)
+        self.ring = np.zeros((C, self.ring_n))
+        self.ring_pos = previous.ring_pos if prev_map else 0
+        sp = ct_rate / dcs.BIT_RATE                       # ~22.3 samples per bit
+        nbits = int((self.dcs_n - sp) // sp)
+        self.dcs_bounds = np.array([[int(round(ph * sp / self.DCS_PHASES + k * sp)) for k in range(nbits + 1)]
+                                    for ph in range(self.DCS_PHASES)], dtype=np.int64)
+        self.dcs_weights = (1 << np.arange(dcs.WORD_BITS)).astype(np.int64)
+        self.dcs_patterns, self.dcs_pattern_class = dcs.lookup_arrays()
         self.ct_win = np.hanning(self.ct_n)
         t = np.arange(self.ct_n) / ct_rate
         self.ct_basis = (np.exp(-2j * np.pi * np.outer(CTCSS_TONES, t)) * self.ct_win).T  # (n, tones)
@@ -256,7 +278,7 @@ class ChannelBank:
             self.de_zi[i] = previous.de_zi[j]
             self.voice_zi[:, i] = previous.voice_zi[:, j]
             self.ct_zi[:, i] = previous.ct_zi[:, j]
-            self.ct_hist[i] = previous.ct_hist[j]
+            self.ring[i] = previous.ring[j]
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -270,7 +292,7 @@ class ChannelBank:
         C, hop, n = len(self.rows), chz.hop_c, chz.n
         if C == 0:
             e = np.zeros((0, hop), dtype=np.float32)
-            return BankFrame(e, np.zeros(0), np.zeros(0), [], [], [])
+            return BankFrame(e, np.zeros(0), np.zeros(0), [], [], [], [])
 
         # Extract every channel: gather bins, filter, batched inverse FFT.
         y = sfft.ifft(X[self.idx] * self.H, axis=1)[:, chz.overlap_c:]
@@ -296,11 +318,11 @@ class ChannelBank:
         audio, self.voice_zi = signal.sosfilt(self.voice_sos, s, axis=1, zi=self.voice_zi)
         audio = (audio * HEADROOM).astype(np.float32)
 
-        self._ctcss(d)
+        self._subaudio(d)
 
         # Noise floor: fast down, slow up.
         rssi_l = rssi.tolist()
-        opened, carrier, tones, targets = [], [], [], np.empty(C, dtype=np.float32)
+        opened, carrier, tones, codes, targets = [], [], [], [], np.empty(C, dtype=np.float32)
         gains = np.empty(C, dtype=np.float32)
         noise = np.empty(C)
         dt = chz.frame_seconds
@@ -314,8 +336,11 @@ class ChannelBank:
             cfg = r.cfg
             is_fm = self.modes[i] != MODE_AM
             tone = r.tone if is_fm else None
+            code = r.dcs_class if is_fm else None
             tone_ok = True
-            if is_fm and cfg.ctcss_hz:
+            if is_fm and cfg.dcs_code:
+                tone_ok = code is not None and code in dcs.accept_classes(cfg.dcs_code, cfg.dcs_polarity)
+            elif is_fm and cfg.ctcss_hz:
                 tone_ok = tone is not None and abs(tone - cfg.ctcss_hz) < 0.6
             is_open = r.squelch.update(v, cfg.squelch_db, cfg.hysteresis_db, cfg.hang_time, tone_ok, dt)
             gains[i] = r.gain
@@ -323,11 +348,12 @@ class ChannelBank:
             r.gain = float(targets[i])
             opened.append(is_open)
             carrier.append(r.squelch.carrier)
-            tones.append(tone)
+            tones.append(tone if code is None else None)
+            codes.append(dcs.class_name(code) if code is not None else None)
 
         g = gains[:, None] + (targets - gains)[:, None] * self.ramp01[None, :]
         audio *= g
-        return BankFrame(audio, rssi, noise, opened, carrier, tones)
+        return BankFrame(audio, rssi, noise, opened, carrier, tones, codes)
 
     def _am_detect(self, y: np.ndarray) -> np.ndarray:
         """Envelope detector with carrier-tracking AGC: output = modulation index."""
@@ -341,27 +367,38 @@ class ChannelBank:
         self.am_carrier[self.am_idx] = new
         return env / np.maximum(car, np.float32(1e-9)) - np.float32(1.0)
 
-    def _ctcss(self, d: np.ndarray) -> None:
+    def _subaudio(self, d: np.ndarray) -> None:
+        """Feed the sub-audio ring buffer and run the CTCSS / DCS detectors when due."""
         if not self.fm_mask.any():
             return
         lp, self.ct_zi = signal.sosfilt(self.ct_sos, d, axis=1, zi=self.ct_zi)
         dec = lp[:, self.ct_phase::self.ct_dec]
         self.ct_phase = (self.ct_phase - d.shape[1]) % self.ct_dec
         k = dec.shape[1]
-        if k >= self.ct_n:
-            self.ct_hist[:] = dec[:, -self.ct_n:]
-        elif k:
-            self.ct_hist[:, :-k] = self.ct_hist[:, k:]
-            self.ct_hist[:, -k:] = dec
+        if k:
+            if k > self.ring_n:
+                dec, k = dec[:, -self.ring_n:], self.ring_n
+            idx = (self.ring_pos + np.arange(k)) % self.ring_n
+            self.ring[:, idx] = dec
+            self.ring_pos = (self.ring_pos + k) % self.ring_n
         for r in self.rows:
-            r.filled = min(self.ct_n, r.filled + k)
+            r.filled = min(self.ring_n, r.filled + k)
         self.ct_counter += 1
-        if self.ct_counter % self.CT_EVERY:
-            return
+        if self.ct_counter % self.CT_EVERY == 0:
+            self._ctcss_eval()
+        if self.ct_counter % self.DCS_EVERY == 2:
+            self._dcs_eval()
+
+    def _recent(self, rows: list[int], n: int) -> np.ndarray:
+        """The last n ring-buffer samples of `rows`, oldest first."""
+        idx = (self.ring_pos - n + np.arange(n)) % self.ring_n
+        return self.ring[np.ix_(rows, idx)]
+
+    def _ctcss_eval(self) -> None:
         ready = [i for i, r in enumerate(self.rows) if r.filled >= self.ct_n and self.fm_mask[i]]
         if not ready:
             return
-        x = self.ct_hist[ready]
+        x = self._recent(ready, self.ct_n)
         x = x - x.mean(axis=1, keepdims=True)
         powers = np.abs(x @ self.ct_basis) ** 2 / self.ct_norm_amp          # (R, tones)
         total = np.square(x * self.ct_win).sum(axis=1) / self.ct_norm_pow   # (R,)
@@ -369,6 +406,59 @@ class ChannelBank:
         for j, i in enumerate(ready):
             ratio = float(powers[j, best[j]] / total[j]) if total[j] > 1e-12 else 0.0
             self._tone_state(self.rows[i], CTCSS_TONES[int(best[j])], ratio)
+
+    def _dcs_eval(self) -> None:
+        """Slice the sub-audio stream into bits and look up every 23-bit window."""
+        ready, idle = [], []
+        for i, r in enumerate(self.rows):
+            if not self.fm_mask[i]:
+                continue
+            if r.filled >= self.dcs_n and r.squelch.carrier:
+                ready.append(i)
+            elif r.dcs_class is not None or r.dcs_candidate is not None:
+                idle.append(i)
+        for i in idle:
+            self._dcs_state(self.rows[i], None)
+        if not ready:
+            return
+        x = self._recent(ready, self.dcs_n)
+        lo, hi = np.percentile(x, [10, 90], axis=1)
+        x = x - ((lo + hi) / 2)[:, None]                 # slice at the middle of the two FSK levels
+        cs = np.concatenate((np.zeros((len(ready), 1)), np.cumsum(x, axis=1)), axis=1)
+        sums = cs[:, self.dcs_bounds[:, 1:]] - cs[:, self.dcs_bounds[:, :-1]]   # (R, phases, bits)
+        bits = (sums > 0).astype(np.int64)
+        windows = np.lib.stride_tricks.sliding_window_view(bits, dcs.WORD_BITS, axis=2)
+        ints = windows @ self.dcs_weights                                         # (R, phases, windows)
+        pos = np.minimum(np.searchsorted(self.dcs_patterns, ints), len(self.dcs_patterns) - 1)
+        hit = self.dcs_patterns[pos] == ints
+        cls = np.where(hit, self.dcs_pattern_class[pos], -1)
+        best_phase = np.argmax(hit.sum(axis=2), axis=1)
+        for j, i in enumerate(ready):
+            c = cls[j, best_phase[j]]
+            c = c[c >= 0]
+            found = None
+            if len(c) >= self.DCS_MIN_HITS:
+                counts = np.bincount(c)
+                top = int(np.argmax(counts))
+                if counts[top] >= self.DCS_MIN_HITS and counts[top] >= self.DCS_DOMINANCE * len(c):
+                    found = top
+            self._dcs_state(self.rows[i], found)
+
+    @staticmethod
+    def _dcs_state(r: _Row, found: Optional[int]) -> None:
+        if found is None:
+            r.dcs_candidate, r.dcs_streak = None, 0
+            r.dcs_miss += 1
+            if r.dcs_miss >= 2:
+                r.dcs_class = None
+            return
+        r.dcs_miss = 0
+        if found == r.dcs_candidate:
+            r.dcs_streak += 1
+        else:
+            r.dcs_candidate, r.dcs_streak = found, 1
+        if found == r.dcs_class or r.dcs_streak >= 2:
+            r.dcs_class = found
 
     def _tone_state(self, r: _Row, best: float, ratio: float) -> None:
         if ratio >= self.CT_OPEN_RATIO and best == r.candidate:

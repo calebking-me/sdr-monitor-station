@@ -111,6 +111,20 @@ class SettingsDialog(QDialog):
         f.addRow("", self.auto_center)
         f.addRow("Manual centre", self.manual_center)
 
+        behaviour = QGroupBox("Priority and alerts")
+        self.duck = QDoubleSpinBox(decimals=0, minimum=-60, maximum=0, suffix=" dB")
+        self.duck.setValue(cfg.priority_duck_db)
+        self.duck.setToolTip("How much quieter other channels become while a priority channel is active "
+                             "(-60 dB is practically muted).")
+        self.alert_popup = QCheckBox("Show a pop-up notification")
+        self.alert_popup.setChecked(cfg.alert_popup)
+        self.alert_sound = QCheckBox("Play the system alert sound")
+        self.alert_sound.setChecked(cfg.alert_sound)
+        f = QFormLayout(behaviour)
+        f.addRow("Other channels during priority", self.duck)
+        f.addRow("Alert channels", self.alert_popup)
+        f.addRow("", self.alert_sound)
+
         misc = QGroupBox("Recording")
         self.rec_dir = QLineEdit(cfg.recordings_dir)
         self.rec_dir.setPlaceholderText(str(cfg.effective_recordings_dir()))
@@ -131,6 +145,7 @@ class SettingsDialog(QDialog):
         lay.addLayout(src_form)
         lay.addWidget(self.pages)
         lay.addWidget(tuner)
+        lay.addWidget(behaviour)
         lay.addWidget(misc)
         lay.addWidget(buttons)
         self._on_source()
@@ -188,6 +203,9 @@ class SettingsDialog(QDialog):
         r.auto_center = self.auto_center.isChecked()
         r.manual_center = self.manual_center.value() * 1e6
         self.cfg.recordings_dir = self.rec_dir.text().strip()
+        self.cfg.priority_duck_db = self.duck.value()
+        self.cfg.alert_popup = self.alert_popup.isChecked()
+        self.cfg.alert_sound = self.alert_sound.isChecked()
         after = (r.source, r.device_index, r.tcp_host, r.tcp_port, r.file_path,
                  r.file_center, r.file_rate, r.sample_rate, r.file_loop)
         return before != after

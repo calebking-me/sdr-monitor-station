@@ -274,3 +274,118 @@ def test_rtl_tcp_reconnects_after_server_drop(monkeypatch, fake_audio):
     srv.close()
     text = "\n".join(msgs + eng.poll().messages)
     assert "reconnecting" in text and text.count("started") >= 1
+
+
+def _bursts_profile(tmp_path, bursts, hold, seconds):
+    center = 155e6
+    data, chans = generate(str(tmp_path / "h"), seconds, center, FS,
+                           channels=[SynthChannel("Rpt", 200_000, -40, bursts=bursts)])
+    cfg = make_profile(data, chans, center, FS)
+    cfg.radio.file_loop = False
+    cfg.recordings_dir = str(tmp_path / "rec")
+    ch = cfg.channels[0]
+    ch.record, ch.hang_time, ch.hold_time = True, 0.1, hold
+    return cfg
+
+
+def _run_to_end(eng, timeout=30):
+    events = []
+    eng.start()
+    assert wait_for(lambda: (events.extend(eng.poll().events) or not eng.running), timeout)
+    eng.stop()
+    return events + eng.poll().events
+
+
+def test_hold_merges_short_gaps_into_one_recording(tmp_path, fake_audio):
+    # Repeater with a CW-like ID: four short key-ups 0.4 s apart.
+    bursts = [(0.5, 1.4), (1.8, 2.1), (2.5, 2.8), (3.2, 3.5)]
+    cfg = _bursts_profile(tmp_path, bursts, hold=1.5, seconds=5.5)
+    events = _run_to_end(Engine(cfg))
+    assert len(events) == 1, [(e.start, e.end) for e in events]
+    ev = events[0]
+    assert ev.duration == pytest.approx(3.5 + 0.1 - 0.5, abs=0.35)
+    files = list((tmp_path / "rec").glob("*.wav"))
+    assert len(files) == 1
+    rate, audio = wavfile.read(files[0])
+    # The file spans the whole sequence, gaps included as silence.
+    assert len(audio) / rate == pytest.approx(ev.duration, abs=0.35)
+    gap = audio[int(1.6 * rate) - int(0.5 * rate): int(1.7 * rate) - int(0.5 * rate)]
+    assert np.max(np.abs(gap)) < 50
+
+
+def test_gaps_longer_than_hold_split_transmissions(tmp_path, fake_audio):
+    bursts = [(0.5, 1.0), (2.5, 3.0)]                 # 1.5 s apart
+    cfg = _bursts_profile(tmp_path, bursts, hold=0.5, seconds=4.0)
+    events = _run_to_end(Engine(cfg))
+    assert len(events) == 2
+    assert len(list((tmp_path / "rec").glob("*.wav"))) == 2
+
+
+def test_channel_lists_limit_what_is_monitored(monkeypatch, fake_audio):
+    from sdrscanner.config import ChannelGroup
+    src = ToneSource([(146.0e6, 0.05, 700.0), (146.3e6, 0.05, 900.0)])
+    monkeypatch.setattr(engine_mod, "make_source", lambda cfg: src)
+    a = ChannelConfig(name="A", frequency=146.0e6, squelch_db=-60)
+    b = ChannelConfig(name="B", frequency=146.3e6, squelch_db=-60)
+    cfg = AppConfig(channels=[a, b], groups=[ChannelGroup("Only A", [a.id])], active_group="Only A")
+    eng = Engine(cfg)
+    eng.start()
+    try:
+        assert wait_for(lambda: eng.poll().channels.get(a.id) and eng.poll().channels[a.id].open)
+        st = eng.poll().channels
+        assert st[b.id].state == "not_in_list" and not st[b.id].open
+        cfg.active_group = ""                       # back to all channels
+        eng.channels_changed()
+        assert wait_for(lambda: eng.poll().channels[b.id].open)
+    finally:
+        eng.stop()
+
+
+def test_priority_ducks_other_channels_and_temporary_mute(monkeypatch, fake_audio):
+    src = ToneSource([(146.0e6, 0.05, 700.0), (146.3e6, 0.05, 1300.0)])
+    monkeypatch.setattr(engine_mod, "make_source", lambda cfg: src)
+    normal = ChannelConfig(name="N", frequency=146.0e6, squelch_db=-60, pan=-1.0)
+    prio = ChannelConfig(name="P", frequency=146.3e6, squelch_db=-60, pan=1.0)
+    cfg = AppConfig(channels=[normal, prio], priority_duck_db=-20.0)
+    eng = Engine(cfg)
+    eng.start()
+    try:
+        assert wait_for(lambda: len(fake_audio.get("audio", FakeAudio()).written.get("", [])) > 60)
+        audio = fake_audio["audio"]
+
+        def level(side, since):
+            return float(np.std(np.concatenate(audio.written[""][since:])[:, side]))
+        time.sleep(0.4)
+        n = len(audio.written[""])
+        time.sleep(0.5)
+        before = level(0, n)
+        prio.priority = True
+        time.sleep(0.4)
+        n = len(audio.written[""])
+        time.sleep(0.5)
+        ducked = level(0, n)
+        assert ducked == pytest.approx(before * 0.1, rel=0.25)        # -20 dB
+        assert level(1, n) > 0.05                                       # priority channel unaffected
+        eng.mute_until[prio.id] = time.time() + 60                    # temporary mute
+        time.sleep(0.4)
+        n = len(audio.written[""])
+        time.sleep(0.5)
+        assert level(1, n) < 1e-6 and level(0, n) == pytest.approx(before, rel=0.25)
+    finally:
+        eng.stop()
+
+
+def test_dcs_end_to_end_and_logging(tmp_path, fake_audio):
+    center = 460e6
+    chans = [SynthChannel("DCS rpt", -250_000, -40, dcs="023", bursts=[(0.4, 2.6)]),
+             SynthChannel("Other", 300_000, -40, dcs="754", bursts=[(0.4, 2.6)])]
+    data, chans = generate(str(tmp_path / "d"), 3.2, center, FS, channels=chans)
+    cfg = make_profile(data, chans, center, FS)
+    cfg.radio.file_loop = False
+    # Listen to both frequencies with DCS 023 squelch: only the first should open.
+    for ch in cfg.channels:
+        ch.dcs_code, ch.dcs_polarity = "023", "N"
+    events = _run_to_end(Engine(cfg))
+    names = {e.channel_name: e for e in events}
+    assert set(names) == {"DCS rpt"}
+    assert names["DCS rpt"].dcs == "023N" and names["DCS rpt"].tone is None

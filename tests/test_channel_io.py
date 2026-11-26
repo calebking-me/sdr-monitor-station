@@ -93,9 +93,9 @@ def test_chirp_export_is_recognised():
     assert by["W1AW"].ctcss_hz is None and by["W1AW"].bandwidth == 25_000       # 'Tone' = TX only
     assert by["TSQL rpt"].ctcss_hz == 123.0 and by["TSQL rpt"].enabled is False   # Skip=S
     assert by["DCS"].bandwidth == 12_500 and by["DCS"].ctcss_hz is None
+    assert (by["DCS"].dcs_code, by["DCS"].dcs_polarity) == ("023", "N")     # DTCS -> DCS squelch
     assert by["Mem 5"].mode == MODE_AM
     assert "DSTAR" not in by and any("DV" in e for e in r.errors)
-    assert any("DCS" in w for w in r.warnings)
 
 
 def test_export_import_roundtrip(tmp_path):
@@ -167,3 +167,33 @@ def test_fuzzed_csv_never_crashes():
         for c in r.channels:
             assert 100_000 <= c.frequency <= 6e9
             assert "\x00" not in c.name and len(c.name) <= 64
+
+
+def test_export_import_roundtrip_with_dcs_lists_and_flags(tmp_path):
+    a = ChannelConfig(name="Rpt", frequency=146.94e6, dcs_code="023", dcs_polarity="I", hold_time=4.0,
+                      priority=True, alert=True)
+    b = ChannelConfig(name="Any pol", frequency=146.97e6, dcs_code="754", dcs_polarity="either")
+    lists = {a.id: ["Local", "Repeaters"], b.id: []}
+    p = tmp_path / "x.csv"
+    export_channels_csv([a, b], p, lambda cid: lists[cid])
+    back = import_channels_csv(p)
+    assert not back.errors and not back.warnings
+    ra, rb = back.channels
+    assert (ra.dcs_code, ra.dcs_polarity, ra.hold_time, ra.priority, ra.alert) == ("023", "I", 4.0, True, True)
+    assert (rb.dcs_code, rb.dcs_polarity) == ("754", "either")
+    assert back.memberships == {ra.id: ["Local", "Repeaters"]}
+
+
+def test_chirp_dtcs_polarity_and_cross_modes():
+    text = ("Location,Name,Frequency,Duplex,Offset,Tone,rToneFreq,cToneFreq,DtcsCode,DtcsPolarity,RxDtcsCode,"
+            "CrossMode,Mode\n"
+            "0,Rev,145.23,-,0.6,DTCS,88.5,88.5,023,NR,023,Tone->Tone,NFM\n"
+            "1,X1,145.33,-,0.6,Cross,100.0,88.5,023,NN,754,Tone->DTCS,FM\n"
+            "2,X2,145.43,-,0.6,Cross,100.0,110.9,023,NN,754,DTCS->Tone,FM\n"
+            "3,Bad,145.53,-,0.6,DTCS,88.5,88.5,099,NN,023,Tone->Tone,FM\n")
+    r = parse_channels_csv(text)
+    by = {c.name: c for c in r.channels}
+    assert (by["Rev"].dcs_code, by["Rev"].dcs_polarity) == ("023", "I")      # RX polarity reversed
+    assert (by["X1"].dcs_code, by["X1"].ctcss_hz) == ("754", None)          # receive code
+    assert (by["X2"].dcs_code, by["X2"].ctcss_hz) == (None, 110.9)
+    assert by["Bad"].dcs_code is None and any("099" in w for w in r.warnings)

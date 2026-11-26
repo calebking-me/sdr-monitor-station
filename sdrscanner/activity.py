@@ -30,14 +30,23 @@ class ActivityEvent:
     tone: Optional[float] = None
     recording: str = ""
     mode: str = "FM"
+    dcs: Optional[str] = None     # detected DCS code, e.g. "023N"
 
     @property
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
 
+    @property
+    def tone_text(self) -> str:
+        if self.dcs:
+            return f"DCS {self.dcs}"
+        if self.tone:
+            return f"CTCSS {self.tone:.1f}"
+        return ""
+
 
 CSV_FIELDS = ["start", "end", "channel", "frequency_mhz", "mode", "duration_s", "peak_dbfs",
-              "ctcss_hz", "recording"]
+              "ctcss_hz", "dcs", "recording"]
 
 
 def csv_safe(value: object) -> str:
@@ -66,6 +75,7 @@ def event_row(ev: ActivityEvent) -> dict:
         "duration_s": f"{ev.duration:.1f}",
         "peak_dbfs": f"{ev.peak_dbfs:.1f}",
         "ctcss_hz": f"{ev.tone:.1f}" if ev.tone else "",
+        "dcs": ev.dcs or "",
         "recording": ev.recording,
     }
 
