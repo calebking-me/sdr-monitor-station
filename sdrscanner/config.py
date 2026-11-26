@@ -21,12 +21,20 @@ from typing import Any, Optional
 
 from . import dcs
 
-PROFILE_VERSION = 3
+PROFILE_VERSION = 4
 MAX_PROFILE_BYTES = 5 * 1024 * 1024
 MAX_CHANNELS = 256
 MAX_GROUPS = 64
 MAX_GROUP_NAME = 40
 DEFAULT_HOLD_TIME = 2.0
+
+# Scanning between sets of channels (see planner.plan_scan and scan.ScanController).
+DEFAULT_SCAN_LISTEN = 0.5     # seconds on each set when nothing is heard (scan speed)
+DEFAULT_SCAN_DWELL = 2.0      # seconds to stay after a transmission ends
+MIN_SCAN_LISTEN, MAX_SCAN_LISTEN = 0.1, 30.0
+MAX_SCAN_DWELL = 60.0
+MAX_SCAN_BUSY = 600.0
+MAX_SCAN_SETTLE_MS = 1000.0
 
 SOURCE_RTLSDR = "rtlsdr"
 SOURCE_RTLTCP = "rtl_tcp"
@@ -323,6 +331,32 @@ class RadioConfig:
 
 
 @dataclass
+class ScanConfig:
+    """Retuning between sets of channels that do not fit in one receiver bandwidth."""
+
+    enabled: bool = False
+    listen_time: float = DEFAULT_SCAN_LISTEN   # s per set while it is quiet (scan speed)
+    dwell_time: float = DEFAULT_SCAN_DWELL     # s to stay after the last transmission on a set ends
+    max_dwell: float = 0.0                     # s; leave a set that stays busy this long (0 = never)
+    settle_ms: float = 0.0                     # ms discarded after each retune (0 = automatic)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any], warnings: Optional[list[str]] = None) -> "ScanConfig":
+        if not isinstance(d, dict):
+            d = {}
+        fx = _Fixer(warnings, "scan")
+        sc = cls()
+        sc.enabled = fx.boolean(d.get("enabled", False), False, "scan enabled")
+        sc.listen_time = fx.num(d.get("listen_time", DEFAULT_SCAN_LISTEN), DEFAULT_SCAN_LISTEN,
+                                MIN_SCAN_LISTEN, MAX_SCAN_LISTEN, "time per set")
+        sc.dwell_time = fx.num(d.get("dwell_time", DEFAULT_SCAN_DWELL), DEFAULT_SCAN_DWELL,
+                               0.0, MAX_SCAN_DWELL, "dwell time")
+        sc.max_dwell = fx.num(d.get("max_dwell", 0.0), 0.0, 0.0, MAX_SCAN_BUSY, "maximum time on a busy set")
+        sc.settle_ms = fx.num(d.get("settle_ms", 0.0), 0.0, 0.0, MAX_SCAN_SETTLE_MS, "retune settle time")
+        return sc
+
+
+@dataclass
 class AppConfig:
     radio: RadioConfig = field(default_factory=RadioConfig)
     channels: list[ChannelConfig] = field(default_factory=list)
@@ -333,6 +367,7 @@ class AppConfig:
     priority_duck_db: float = -15.0       # level of other channels while a priority channel is active
     alert_sound: bool = True
     alert_popup: bool = True
+    scan: ScanConfig = field(default_factory=ScanConfig)
     # Problems found while loading (not saved).
     load_warnings: list[str] = field(default_factory=list, repr=False, compare=False)
 
@@ -348,6 +383,7 @@ class AppConfig:
             "priority_duck_db": self.priority_duck_db,
             "alert_sound": self.alert_sound,
             "alert_popup": self.alert_popup,
+            "scan": asdict(self.scan),
         }
 
     @classmethod
@@ -383,6 +419,7 @@ class AppConfig:
             priority_duck_db=fx.num(d.get("priority_duck_db", -15.0), -15.0, -60.0, 0.0, "priority ducking"),
             alert_sound=fx.boolean(d.get("alert_sound", True), True, "alert sound"),
             alert_popup=fx.boolean(d.get("alert_popup", True), True, "alert pop-up"),
+            scan=ScanConfig.from_dict(d.get("scan", {}), warnings),
         )
         cfg.groups = _load_groups(d.get("groups", []), {c.id for c in channels}, warnings)
         active = clean_text(d.get("active_group", ""), MAX_GROUP_NAME)

@@ -75,6 +75,37 @@ def _librtlsdr() -> str:
     return f"{desc}; {len(devs)} dongle(s) attached" + (f": {', '.join(devs)}" if devs else "")
 
 
+def _scanning() -> str:
+    """Scanning between two sets 316 MHz apart with a simulated, tunable radio."""
+    from .config import AppConfig, ChannelConfig
+    from .engine import Engine
+    from .tools.sim_source import SimTransmitter, SimulatedSource
+    src = SimulatedSource([SimTransmitter(462.5625e6, -40, bursts=[(0.3, 10.0)])])
+    cfg = AppConfig(channels=[ChannelConfig(name="A", frequency=146.52e6, squelch_db=-60),
+                              ChannelConfig(name="B", frequency=462.5625e6, squelch_db=-60)])
+    cfg.scan.enabled = True
+    cfg.scan.listen_time = 0.2
+    eng = Engine(cfg)
+    eng.source_factory = lambda _cfg: src
+    eng.start()
+    visited, opened = set(), False
+    try:
+        deadline = time.time() + 8
+        while time.time() < deadline and not opened:
+            snap = eng.poll()
+            if snap.scan is not None and snap.scan.state != "single":
+                visited.add(snap.scan.index)
+            st = snap.channels.get(cfg.channels[1].id)
+            opened = bool(st and st.open)
+            time.sleep(0.02)
+    finally:
+        eng.stop()
+    if not opened or len(visited) < 2:
+        raise RuntimeError(f"scanner did not stop on the active set (visited {sorted(visited)}, "
+                           f"{len(src.retunes)} retunes)")
+    return f"2 scan sets, {len(src.retunes)} retune(s), stopped on the active channel"
+
+
 def _gui_and_playback() -> str:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
@@ -118,6 +149,7 @@ def run(report_path: str | None = None) -> int:
         ("DSP", _dsp, True),
         ("Audio (PortAudio)", _audio, True),
         ("librtlsdr", _librtlsdr, True),
+        ("Scanning", _scanning, True),
         ("GUI + IQ playback", _gui_and_playback, True),
     ]
     for name, fn, required in checks:

@@ -5,11 +5,14 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSizePolicy, QSpinBox,
     QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from ..config import RTL_SAMPLE_RATES, SOURCE_FILE, SOURCE_RTLSDR, SOURCE_RTLTCP, AppConfig
+from ..config import (
+    MAX_SCAN_BUSY, MAX_SCAN_DWELL, MAX_SCAN_LISTEN, MAX_SCAN_SETTLE_MS, MIN_SCAN_LISTEN, RTL_SAMPLE_RATES,
+    SOURCE_FILE, SOURCE_RTLSDR, SOURCE_RTLTCP, AppConfig,
+)
 from ..sources import inspect_iq_file, list_rtlsdr_devices
 
 
@@ -111,6 +114,41 @@ class SettingsDialog(QDialog):
         f.addRow("", self.auto_center)
         f.addRow("Manual centre", self.manual_center)
 
+        sc = cfg.scan
+        scan = QGroupBox("Scanning (channels too far apart for one tuning)")
+        self.scan_enabled = QCheckBox("Scan: step the receiver between sets of channels")
+        self.scan_enabled.setChecked(sc.enabled)
+        self.scan_enabled.setToolTip("Channels that fit in the receiver's bandwidth together form a set. "
+                                     "The receiver tunes to one set at a time, and stays on a set while "
+                                     "something is heard there. Scanning always chooses the centre "
+                                     "frequencies itself.")
+        self.scan_listen = QDoubleSpinBox(decimals=2, minimum=MIN_SCAN_LISTEN, maximum=MAX_SCAN_LISTEN,
+                                          singleStep=0.05, suffix=" s")
+        self.scan_listen.setValue(sc.listen_time)
+        self.scan_listen.setToolTip("Scan speed: how long each quiet set is checked before moving on. "
+                                    "Channels with CTCSS/DCS automatically get the time their tone needs.")
+        self.scan_dwell = QDoubleSpinBox(decimals=1, minimum=0.0, maximum=MAX_SCAN_DWELL, singleStep=0.5,
+                                         suffix=" s")
+        self.scan_dwell.setValue(sc.dwell_time)
+        self.scan_dwell.setToolTip("How long to stay on a set after a transmission ends, to hear the reply")
+        self.scan_busy = QDoubleSpinBox(decimals=0, minimum=0.0, maximum=MAX_SCAN_BUSY, singleStep=5,
+                                        suffix=" s")
+        self.scan_busy.setSpecialValueText("never")
+        self.scan_busy.setValue(sc.max_dwell)
+        self.scan_busy.setToolTip("Move on from a set that has been busy this long, so a channel that never "
+                                  "stops (a weather broadcast, a stuck transmitter) cannot stop the scan")
+        self.scan_settle = QSpinBox(minimum=0, maximum=int(MAX_SCAN_SETTLE_MS), singleStep=10, suffix=" ms")
+        self.scan_settle.setSpecialValueText("automatic")
+        self.scan_settle.setValue(int(round(sc.settle_ms)))
+        self.scan_settle.setToolTip("Samples thrown away after each retune while the tuner settles and old "
+                                    "samples drain (automatic: 50 ms for USB, 150 ms for rtl_tcp)")
+        f = QFormLayout(scan)
+        f.addRow("", self.scan_enabled)
+        f.addRow("Time per set (scan speed)", self.scan_listen)
+        f.addRow("Dwell after a transmission", self.scan_dwell)
+        f.addRow("Leave a busy set after", self.scan_busy)
+        f.addRow("Retune settle time", self.scan_settle)
+
         behaviour = QGroupBox("Priority and alerts")
         self.duck = QDoubleSpinBox(decimals=0, minimum=-60, maximum=0, suffix=" dB")
         self.duck.setValue(cfg.priority_duck_db)
@@ -139,19 +177,33 @@ class SettingsDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        # Two columns keep the dialog short enough for small (768 px) screens.
         lay = QVBoxLayout(self)
+        cols = QHBoxLayout()
+        left, right = QVBoxLayout(), QVBoxLayout()
         src_form = QFormLayout()
         src_form.addRow("Source", self.source)
-        lay.addLayout(src_form)
-        lay.addWidget(self.pages)
-        lay.addWidget(tuner)
-        lay.addWidget(behaviour)
-        lay.addWidget(misc)
+        left.addLayout(src_form)
+        left.addWidget(self.pages)
+        left.addWidget(tuner)
+        left.addStretch(1)
+        for w in (scan, behaviour, misc):
+            right.addWidget(w)
+        right.addStretch(1)
+        cols.addLayout(left, 1)
+        cols.addSpacing(8)
+        cols.addLayout(right, 1)
+        lay.addLayout(cols)
         lay.addWidget(buttons)
         self._on_source()
 
     def _on_source(self) -> None:
         self.pages.setCurrentIndex(self.source.currentIndex())
+        # Only the visible page counts for the layout (no gap under the short pages).
+        for i in range(self.pages.count()):
+            pol = QSizePolicy.Preferred if i == self.pages.currentIndex() else QSizePolicy.Ignored
+            self.pages.widget(i).setSizePolicy(pol, pol)
+        self.pages.adjustSize()
 
     def _scan(self) -> None:
         try:
@@ -206,6 +258,12 @@ class SettingsDialog(QDialog):
         self.cfg.priority_duck_db = self.duck.value()
         self.cfg.alert_popup = self.alert_popup.isChecked()
         self.cfg.alert_sound = self.alert_sound.isChecked()
+        sc = self.cfg.scan
+        sc.enabled = self.scan_enabled.isChecked()
+        sc.listen_time = self.scan_listen.value()
+        sc.dwell_time = self.scan_dwell.value()
+        sc.max_dwell = self.scan_busy.value()
+        sc.settle_ms = float(self.scan_settle.value())
         after = (r.source, r.device_index, r.tcp_host, r.tcp_port, r.file_path,
                  r.file_center, r.file_rate, r.sample_rate, r.file_loop)
         return before != after

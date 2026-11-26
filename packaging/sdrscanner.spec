@@ -30,6 +30,7 @@ hiddenimports = [
     "rtlsdr", "rtlsdr.librtlsdr",
     "pyrtlsdrlib", "pyrtlsdrlib.lib", "pyrtlsdrlib.lib.custom_build", "pyrtlsdrlib.platform",
     "scipy.signal", "scipy.fft", "scipy.io.wavfile",
+    "sdrscanner.tools.gen_iq", "sdrscanner.tools.sim_source",     # used by --self-test
 ]
 
 excludes = [

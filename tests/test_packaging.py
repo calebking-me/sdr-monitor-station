@@ -49,4 +49,5 @@ def test_self_test_passes(tmp_path):
     failures = [ln for ln in text.splitlines() if ln.startswith("FAIL") and "librtlsdr" not in ln]
     assert not failures, text
     assert "PASS  GUI + IQ playback" in text
+    assert "PASS  Scanning" in text
     assert code in (0, 1)
