@@ -1,6 +1,8 @@
-"""Channel strip (live controls) and channel edit dialog."""
+"""Channel strip (live controls), channel edit dialog and the strip list."""
 
 from __future__ import annotations
+
+import html
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
@@ -11,9 +13,12 @@ from PySide6.QtWidgets import (
 )
 
 from ..audio import list_output_devices
-from ..config import ChannelConfig
-from ..dsp import CTCSS_TONES
+from ..config import (
+    AM_BANDWIDTHS, CTCSS_TONES, DEFAULT_BANDWIDTH, FM_BANDWIDTHS, MAX_BANDWIDTH, MAX_FREQ, MIN_BANDWIDTH,
+    MIN_FREQ, MODE_AM, MODE_FM, ChannelConfig, clean_color, clean_text,
+)
 from ..engine import ChannelStatus
+from . import theme
 from .widgets import Led, SignalMeter
 
 
@@ -25,35 +30,49 @@ def _slider(lo: int, hi: int, value: int, width: int = 110) -> QSlider:
     return s
 
 
+def bandwidth_label(bw: float) -> str:
+    return f"{bw / 1e3:g}k"
+
+
+def channel_summary(c: ChannelConfig) -> str:
+    tone = f" · CTCSS {c.ctcss_hz:.1f}" if c.ctcss_hz and c.mode == MODE_FM else ""
+    return f"{c.frequency / 1e6:.4f} MHz · {c.mode} {bandwidth_label(c.bandwidth)}{tone}"
+
+
 class ChannelStrip(QFrame):
-    """One row in the channel list with live controls."""
+    """One row in the channel list with live controls (full or compact layout)."""
 
     changed = Signal()               # live setting changed (no DSP rebuild needed)
     structureChanged = Signal()      # enable toggled (DSP rebuild)
     editRequested = Signal(str)
     deleteRequested = Signal(str)
 
-    def __init__(self, cfg: ChannelConfig, parent=None):
+    def __init__(self, cfg: ChannelConfig, compact: bool = False, parent=None):
         super().__init__(parent)
         self.cfg = cfg
+        self.compact = compact
         self.setFrameShape(QFrame.StyledPanel)
         self._noise = -120.0
 
         self.swatch = QLabel()
-        self.swatch.setFixedSize(6, 34)
+        self.swatch.setFixedSize(6, 20 if compact else 34)
         self.enabled = QCheckBox()
         self.enabled.setToolTip("Enable channel")
         self.name = QLabel()
-        self.name.setFixedWidth(210)
+        self.name.setTextFormat(Qt.RichText)        # we escape the user-supplied parts
+        self.name.setFixedWidth(250 if compact else 220)
         self.led = Led()
-        self.meter = SignalMeter()
+        self.meter = SignalMeter(height=16 if compact else 18)
+        if compact:
+            self.meter.setMinimumWidth(90)
         self.tone = QLabel()
+        self.tone.setTextFormat(Qt.PlainText)
         self.tone.setMinimumWidth(80)
-        self.tone.setStyleSheet("color:#aaaaaa")
 
-        self.squelch = _slider(-110, 0, int(cfg.squelch_db))
+        self.squelch = _slider(-110, 0, int(cfg.squelch_db), 90 if compact else 110)
+        self.squelch.setToolTip("Squelch level (dBFS)")
         self.squelch_lbl = QLabel()
-        self.squelch_lbl.setFixedWidth(52)
+        self.squelch_lbl.setFixedWidth(46)
         self.auto_btn = QToolButton(text="Auto")
         self.auto_btn.setToolTip("Set squelch 8 dB above the current noise floor")
         self.volume = _slider(0, 200, int(cfg.volume * 100), 90)
@@ -61,7 +80,6 @@ class ChannelStrip(QFrame):
         self.pan.setToolTip("Left / right fade (double-click to centre)")
         self.pan_lbl = QLabel()
         self.pan_lbl.setFixedWidth(46)
-        self.pan_lbl.setStyleSheet("color:#aaaaaa")
         self.mute = QToolButton(text="M", checkable=True)
         self.mute.setToolTip("Mute")
         self.solo = QToolButton(text="S", checkable=True)
@@ -69,41 +87,53 @@ class ChannelStrip(QFrame):
         self.rec = QToolButton(text="REC", checkable=True)
         self.rec.setToolTip("Record each transmission to WAV")
         edit = QToolButton(text="Edit")
+        edit.setToolTip("Edit all channel settings")
         delete = QToolButton(text="✕")
         delete.setToolTip("Delete channel")
 
-        top = QHBoxLayout()
-        top.setContentsMargins(0, 0, 0, 0)
-        for w in (self.enabled, self.led, self.name, self.meter, self.tone):
-            top.addWidget(w)
-        top.setStretch(3, 1)
-        bottom = QHBoxLayout()
-        bottom.setContentsMargins(0, 0, 0, 0)
-        bottom.addWidget(QLabel("Sql"))
-        bottom.addWidget(self.squelch)
-        bottom.addWidget(self.squelch_lbl)
-        bottom.addWidget(self.auto_btn)
-        bottom.addSpacing(10)
-        bottom.addWidget(QLabel("Vol"))
-        bottom.addWidget(self.volume)
-        bottom.addSpacing(10)
-        bottom.addWidget(QLabel("L"))
-        bottom.addWidget(self.pan)
-        bottom.addWidget(QLabel("R"))
-        bottom.addSpacing(4)
-        bottom.addWidget(self.pan_lbl)
-        bottom.addStretch(1)
-        for w in (self.mute, self.solo, self.rec, edit, delete):
-            bottom.addWidget(w)
-        col = QVBoxLayout()
-        col.setContentsMargins(0, 0, 0, 0)
-        col.setSpacing(2)
-        col.addLayout(top)
-        col.addLayout(bottom)
         outer = QHBoxLayout(self)
-        outer.setContentsMargins(4, 3, 6, 3)
+        outer.setContentsMargins(4, 2 if compact else 3, 6, 2 if compact else 3)
         outer.addWidget(self.swatch)
-        outer.addLayout(col, 1)
+        if compact:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            for w in (self.enabled, self.led, self.name, self.meter, self.tone, self.squelch,
+                      self.squelch_lbl, self.mute, self.solo, self.rec, edit, delete):
+                row.addWidget(w)
+            row.setStretch(3, 1)
+            for w in (self.auto_btn, self.volume, self.pan, self.pan_lbl):
+                w.hide()
+            outer.addLayout(row, 1)
+        else:
+            top = QHBoxLayout()
+            top.setContentsMargins(0, 0, 0, 0)
+            for w in (self.enabled, self.led, self.name, self.meter, self.tone):
+                top.addWidget(w)
+            top.setStretch(3, 1)
+            bottom = QHBoxLayout()
+            bottom.setContentsMargins(0, 0, 0, 0)
+            bottom.addWidget(QLabel("Sql"))
+            bottom.addWidget(self.squelch)
+            bottom.addWidget(self.squelch_lbl)
+            bottom.addWidget(self.auto_btn)
+            bottom.addSpacing(10)
+            bottom.addWidget(QLabel("Vol"))
+            bottom.addWidget(self.volume)
+            bottom.addSpacing(10)
+            bottom.addWidget(QLabel("L"))
+            bottom.addWidget(self.pan)
+            bottom.addWidget(QLabel("R"))
+            bottom.addSpacing(4)
+            bottom.addWidget(self.pan_lbl)
+            bottom.addStretch(1)
+            for w in (self.mute, self.solo, self.rec, edit, delete):
+                bottom.addWidget(w)
+            col = QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(2)
+            col.addLayout(top)
+            col.addLayout(bottom)
+            outer.addLayout(col, 1)
 
         self.refresh_from_config()
         self.enabled.toggled.connect(self._on_enabled)
@@ -132,11 +162,17 @@ class ChannelStrip(QFrame):
         self.rec.setChecked(c.record)
         for w in widgets:
             w.blockSignals(False)
-        self.swatch.setStyleSheet(f"background:{c.color or '#888'}")
-        bw = "12.5k" if c.bandwidth <= 12_500 else "25k"
-        tone = f" · CTCSS {c.ctcss_hz:.1f}" if c.ctcss_hz else ""
-        self.name.setText(f"<b>{c.name}</b><br><span style='color:#aaa'>"
-                          f"{c.frequency / 1e6:.4f} MHz · {bw}{tone}</span>")
+        self.swatch.setStyleSheet(f"background:{clean_color(c.color) or '#888888'}")
+        muted = theme.tokens()["muted"]
+        name = html.escape(c.name)
+        summary = html.escape(channel_summary(c))
+        if self.compact:
+            self.name.setText(f"<b>{name}</b> <span style='color:{muted}'>{summary}</span>")
+        else:
+            self.name.setText(f"<b>{name}</b><br><span style='color:{muted}'>{summary}</span>")
+        self.name.setToolTip(f"<qt>{name}<br>{summary}</qt>")
+        self.tone.setStyleSheet(f"color:{muted}")
+        self.pan_lbl.setStyleSheet(f"color:{muted}")
         self.squelch_lbl.setText(f"{c.squelch_db:.0f} dB")
         self.volume.setToolTip(f"Volume {c.volume * 100:.0f}%")
         self.pan_lbl.setText("ctr" if abs(c.pan) < 0.01 else f"{'L' if c.pan < 0 else 'R'} {abs(c.pan) * 100:.0f}%")
@@ -151,7 +187,7 @@ class ChannelStrip(QFrame):
                 st.state if st else "", ""))
             return
         self._noise = st.noise_db
-        self.led.set_state(st.open, self.cfg.color or "#66ff66")
+        self.led.set_state(st.open, clean_color(self.cfg.color) or "#66ff66")
         self.meter.set_values(st.rssi_db, st.noise_db, self.cfg.squelch_db, st.open)
         self.tone.setText(f"♪ {st.tone:.1f} Hz" if st.tone else "")
 
@@ -168,7 +204,7 @@ class ChannelStrip(QFrame):
         self._set("squelch_db", float(v))
 
     def _on_auto(self) -> None:
-        self.squelch.setValue(int(round(self._noise + 8)))
+        self.squelch.setValue(int(round(min(0.0, self._noise + 8))))
 
     def _on_volume(self, v: int) -> None:
         self._set("volume", v / 100.0)
@@ -184,23 +220,27 @@ class ChannelDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.cfg = cfg
-        self._color = cfg.color
+        self._color = clean_color(cfg.color)
 
         self.name = QLineEdit(cfg.name)
-        self.freq = QDoubleSpinBox(decimals=5, minimum=24.0, maximum=1766.0, singleStep=0.0125, suffix=" MHz")
+        self.name.setMaxLength(64)
+        self.freq = QDoubleSpinBox(decimals=5, minimum=MIN_FREQ / 1e6, maximum=MAX_FREQ / 1e6,
+                                   singleStep=0.0125, suffix=" MHz")
         self.freq.setValue(cfg.frequency / 1e6)
+        self.mode = QComboBox()
+        self.mode.addItem("FM (voice)", MODE_FM)
+        self.mode.addItem("AM (aviation, CB)", MODE_AM)
+        self.mode.setCurrentIndex(1 if cfg.mode == MODE_AM else 0)
         self.bw = QComboBox()
-        self.bw.addItem("12.5 kHz (narrow FM)", 12_500.0)
-        self.bw.addItem("25 kHz (wide/legacy FM)", 25_000.0)
-        self.bw.setCurrentIndex(0 if cfg.bandwidth <= 12_500 else 1)
+        self._fill_bandwidths(cfg.mode, cfg.bandwidth)
         self.enabled = QCheckBox("Enabled")
         self.enabled.setChecked(cfg.enabled)
 
-        self.squelch = QDoubleSpinBox(decimals=1, minimum=-120, maximum=0, suffix=" dBFS")
+        self.squelch = QDoubleSpinBox(decimals=1, minimum=-150, maximum=0, suffix=" dBFS")
         self.squelch.setValue(cfg.squelch_db)
-        self.hyst = QDoubleSpinBox(decimals=1, minimum=0, maximum=20, suffix=" dB")
+        self.hyst = QDoubleSpinBox(decimals=1, minimum=0, maximum=40, suffix=" dB")
         self.hyst.setValue(cfg.hysteresis_db)
-        self.hang = QDoubleSpinBox(decimals=2, minimum=0, maximum=10, singleStep=0.1, suffix=" s")
+        self.hang = QDoubleSpinBox(decimals=2, minimum=0, maximum=60, singleStep=0.1, suffix=" s")
         self.hang.setValue(cfg.hang_time)
         self.ctcss = QComboBox()
         self.ctcss.addItem("Off (carrier squelch)", None)
@@ -212,7 +252,11 @@ class ChannelDialog(QDialog):
         self.deemph = QComboBox()
         self.deemph.addItem("750 µs (standard land-mobile)", 750.0)
         self.deemph.addItem("Off", 0.0)
-        self.deemph.setCurrentIndex(0 if cfg.deemphasis_us > 0 else 1)
+        if cfg.deemphasis_us not in (0.0, 750.0):
+            self.deemph.addItem(f"{cfg.deemphasis_us:g} µs", float(cfg.deemphasis_us))
+            self.deemph.setCurrentIndex(2)
+        else:
+            self.deemph.setCurrentIndex(0 if cfg.deemphasis_us > 0 else 1)
 
         self.volume = QDoubleSpinBox(decimals=0, minimum=0, maximum=200, suffix=" %")
         self.volume.setValue(cfg.volume * 100)
@@ -236,6 +280,7 @@ class ChannelDialog(QDialog):
         form = QFormLayout()
         form.addRow("Name", self.name)
         form.addRow("Frequency", self.freq)
+        form.addRow("Mode", self.mode)
         form.addRow("Bandwidth", self.bw)
         form.addRow("", self.enabled)
         form.addRow(QLabel("<b>Squelch</b>"))
@@ -256,6 +301,32 @@ class ChannelDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addLayout(form)
         lay.addWidget(buttons)
+        self.mode.currentIndexChanged.connect(self._on_mode)
+        self._update_mode_widgets()
+
+    def _fill_bandwidths(self, mode: str, current: float) -> None:
+        self.bw.blockSignals(True)
+        self.bw.clear()
+        choices = AM_BANDWIDTHS if mode == MODE_AM else FM_BANDWIDTHS
+        notes = {12_500.0: " (narrow FM)", 25_000.0: " (wide FM)", 6_000.0: " (narrow AM)",
+                 8_000.0: " (AM voice)", 10_000.0: " (wide AM)"}
+        for bw in choices:
+            self.bw.addItem(f"{bw / 1e3:g} kHz{notes.get(bw, '')}", bw)
+        if MIN_BANDWIDTH <= current <= MAX_BANDWIDTH and current not in choices:
+            self.bw.addItem(f"{current / 1e3:g} kHz (custom)", float(current))
+        i = self.bw.findData(float(current))
+        self.bw.setCurrentIndex(i if i >= 0 else self.bw.findData(DEFAULT_BANDWIDTH[mode]))
+        self.bw.blockSignals(False)
+
+    def _on_mode(self) -> None:
+        mode = self.mode.currentData()
+        self._fill_bandwidths(mode, DEFAULT_BANDWIDTH[mode])
+        self._update_mode_widgets()
+
+    def _update_mode_widgets(self) -> None:
+        fm = self.mode.currentData() == MODE_FM
+        self.ctcss.setEnabled(fm)
+        self.deemph.setEnabled(fm)
 
     def _pick_color(self) -> None:
         c = QColorDialog.getColor(QColor(self._color or "#ffffff"), self)
@@ -265,24 +336,25 @@ class ChannelDialog(QDialog):
 
     def _update_color_btn(self) -> None:
         self.color_btn.setText(self._color or "auto")
-        self.color_btn.setStyleSheet(f"background:{self._color or '#888'}; color:black")
+        self.color_btn.setStyleSheet(f"background:{self._color or '#888888'}; color:black")
 
     def apply(self) -> None:
         c = self.cfg
-        c.name = self.name.text().strip() or "Channel"
-        c.frequency = round(self.freq.value() * 1e6)
+        c.name = clean_text(self.name.text()) or "Channel"
+        c.frequency = float(round(self.freq.value() * 1e6))
+        c.mode = self.mode.currentData()
         c.bandwidth = float(self.bw.currentData())
         c.enabled = self.enabled.isChecked()
         c.squelch_db = self.squelch.value()
         c.hysteresis_db = self.hyst.value()
         c.hang_time = self.hang.value()
-        c.ctcss_hz = self.ctcss.currentData()
-        c.deemphasis_us = float(self.deemph.currentData())
+        c.ctcss_hz = self.ctcss.currentData() if c.mode == MODE_FM else None
+        c.deemphasis_us = float(self.deemph.currentData()) if c.mode == MODE_FM else 0.0
         c.volume = self.volume.value() / 100
         c.pan = self.pan.value() / 100
         c.audio_device = self.device.currentData() or ""
         c.record = self.record.isChecked()
-        c.color = self._color
+        c.color = clean_color(self._color)
 
 
 class ChannelList(QWidget):
@@ -292,17 +364,27 @@ class ChannelList(QWidget):
         super().__init__(parent)
         self.lay = QVBoxLayout(self)
         self.lay.setContentsMargins(2, 2, 2, 2)
-        self.lay.setSpacing(3)
+        self.lay.setSpacing(2)
         self.lay.addStretch(1)
         self.strips: dict[str, ChannelStrip] = {}
+        self.empty = QLabel("No channels yet. Use <b>Add channel</b>, <b>Channels → Add from preset…</b> "
+                            "or <b>Import CSV…</b>, or double-click the spectrum.")
+        self.empty.setAlignment(Qt.AlignCenter)
+        self.empty.setWordWrap(True)
+        self.lay.insertWidget(0, self.empty)
 
-    def rebuild(self, channels, connect) -> None:
+    def rebuild(self, channels, connect, compact: bool = False) -> None:
         for s in self.strips.values():
             s.setParent(None)
             s.deleteLater()
         self.strips.clear()
         for c in channels:
-            s = ChannelStrip(c)
+            s = ChannelStrip(c, compact)
             connect(s)
             self.lay.insertWidget(self.lay.count() - 1, s)
             self.strips[c.id] = s
+        self.empty.setVisible(not self.strips)
+
+    def refresh_all(self) -> None:
+        for s in self.strips.values():
+            s.refresh_from_config()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox,
@@ -30,6 +31,7 @@ class SettingsDialog(QDialog):
         self.device_index = QSpinBox(minimum=0, maximum=15)
         self.device_index.setValue(r.device_index)
         self.device_list = QLabel("")
+        self.device_list.setTextFormat(Qt.PlainText)      # USB strings come from the device
         self.device_list.setWordWrap(True)
         scan = QPushButton("Detect devices")
         scan.clicked.connect(self._scan)
@@ -54,15 +56,16 @@ class SettingsDialog(QDialog):
         self.file_path = QLineEdit(r.file_path)
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse)
-        self.file_center = QDoubleSpinBox(decimals=5, minimum=0, maximum=2000, suffix=" MHz")
+        self.file_center = QDoubleSpinBox(decimals=5, minimum=0, maximum=6000, suffix=" MHz")
         self.file_center.setValue(r.file_center / 1e6)
-        self.file_rate = QDoubleSpinBox(decimals=4, minimum=0, maximum=20, suffix=" MS/s")
+        self.file_rate = QDoubleSpinBox(decimals=4, minimum=0, maximum=40, suffix=" MS/s")
         self.file_rate.setValue(r.file_rate / 1e6)
         self.file_loop = QCheckBox("Loop playback")
         self.file_loop.setChecked(r.file_loop)
         self.file_info = QLabel("Supports SigMF (.sigmf-meta), WAV IQ (SDR#/SDR++), and raw "
                                 ".cu8/.bin (rtl_sdr), .cs8, .cs16, .cf32/.cfile. Centre and rate "
                                 "are read from metadata or the file name when available.")
+        self.file_info.setTextFormat(Qt.PlainText)
         self.file_info.setWordWrap(True)
         f = QFormLayout(file_page)
         row = QHBoxLayout()
@@ -92,11 +95,11 @@ class SettingsDialog(QDialog):
         self.gain.setValue(r.gain_db)
         self.agc.toggled.connect(lambda v: self.gain.setEnabled(not v))
         self.gain.setEnabled(not r.agc)
-        self.ppm = QSpinBox(minimum=-200, maximum=200, suffix=" ppm")
+        self.ppm = QSpinBox(minimum=-500, maximum=500, suffix=" ppm")
         self.ppm.setValue(r.ppm)
         self.auto_center = QCheckBox("Choose centre frequency automatically")
         self.auto_center.setChecked(r.auto_center)
-        self.manual_center = QDoubleSpinBox(decimals=4, minimum=24, maximum=1766, suffix=" MHz")
+        self.manual_center = QDoubleSpinBox(decimals=4, minimum=24, maximum=2200, suffix=" MHz")
         self.manual_center.setValue(r.manual_center / 1e6)
         self.auto_center.toggled.connect(lambda v: self.manual_center.setEnabled(not v))
         self.manual_center.setEnabled(not r.auto_center)
@@ -151,10 +154,9 @@ class SettingsDialog(QDialog):
         self.file_path.setText(path)
         try:
             info = inspect_iq_file(path)
-            if info.center:
-                self.file_center.setValue(info.center / 1e6)
-            if info.sample_rate:
-                self.file_rate.setValue(info.sample_rate / 1e6)
+            # Values the new file does not provide are cleared rather than kept from the old one.
+            self.file_center.setValue((info.center or 0.0) / 1e6)
+            self.file_rate.setValue((info.sample_rate or 0.0) / 1e6)
             missing = [n for n, v in (("centre", info.center), ("rate", info.sample_rate)) if not v]
             self.file_info.setText(f"Format: {info.kind}" + (
                 f" — enter {' and '.join(missing)} manually" if missing else " — metadata found"))

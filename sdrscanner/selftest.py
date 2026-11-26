@@ -34,8 +34,15 @@ def _dsp() -> str:
     near = np.abs(f - 1000) < 20
     sinad = 10 * np.log10(Y[near].sum() / Y[~near].sum())
     if sinad < 40:
-        raise RuntimeError(f"demodulator SINAD too low: {sinad:.1f} dB")
-    return f"1 kHz test tone SINAD {sinad:.1f} dB"
+        raise RuntimeError(f"FM demodulator SINAD too low: {sinad:.1f} dB")
+    am_x = (0.05 * (1 + 0.6 * np.sin(2 * np.pi * 1000 * t)) * np.exp(2j * np.pi * -off * t)).astype(np.complex64)
+    chz = Channelizer(fs, 0)
+    p = ChannelProcessor(chz, ChannelConfig(frequency=-off, mode="AM", bandwidth=8000, squelch_db=-60))
+    y = np.concatenate([p.process(X, i, chz).audio for i, X in chz.frames(am_x)])[AUDIO_RATE // 4:]
+    level = float(np.std(y) * np.sqrt(2))
+    if not 0.25 < level < 0.35:
+        raise RuntimeError(f"AM demodulator level wrong: {level:.3f}")
+    return f"FM 1 kHz test tone SINAD {sinad:.1f} dB; AM level {level:.2f} (expected 0.30)"
 
 
 def _audio() -> str:
@@ -60,6 +67,7 @@ def _gui_and_playback() -> str:
     os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
     from PySide6.QtWidgets import QApplication
     from .gui.main_window import MainWindow
+    from .gui.view import ViewSettings
     from .tools.gen_iq import SynthChannel, generate, make_profile
 
     app = QApplication.instance() or QApplication([])
@@ -70,7 +78,7 @@ def _gui_and_playback() -> str:
         data, chans = generate(str(Path(tmp) / "selftest"), 2.2, center, fs, channels=chans)
         cfg = make_profile(data, chans, center, fs)
         cfg.radio.file_loop = False
-        win = MainWindow(cfg)
+        win = MainWindow(cfg, view=ViewSettings(), persist_view=False)   # never touch user settings
         win._autosave = False
         win.show()
         win.toggle_running()
