@@ -621,15 +621,15 @@ does the same on every push and pull request. It runs the test suite on
 Windows, builds the exe, runs its self-test, and uploads the zip as an
 artifact.
 
-To publish a GitHub release with the zip, either push a tag such as `v0.2.0`,
+To publish a GitHub release with the zip, either push a tag such as `v0.3.0`,
 or run the workflow manually on `main` (*Actions → Windows build → Run
 workflow*) with *release_tag* set. A manual run creates the tag for you. In both
 cases the tag must match the app version. When you bump the version, update
 `sdrscanner/__init__.py`, `pyproject.toml` and `packaging/version_info.txt`
 (a test checks they agree).
 
-`--self-test` checks the FM and AM DSP chain, PortAudio, librtlsdr loading, and
-the GUI with an IQ playback run. No dongle or sound card is needed. It exits
+`--self-test` checks the FM and AM DSP chain, PortAudio, librtlsdr loading,
+scanning (with a simulated radio), and the GUI with an IQ playback run. No dongle or sound card is needed. It exits
 non-zero on failure, and because the exe has no console window, it writes its
 report to the file you name.
 
