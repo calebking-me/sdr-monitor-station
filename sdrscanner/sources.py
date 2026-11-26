@@ -13,7 +13,10 @@ from typing import Optional
 
 import numpy as np
 
-from .config import SOURCE_FILE, SOURCE_RTLSDR, SOURCE_RTLTCP, RadioConfig
+from .config import (
+    MAX_FILE_RATE, MAX_FREQ, MIN_FILE_RATE, MIN_FREQ, SOURCE_FILE, SOURCE_RTLSDR, SOURCE_RTLTCP,
+    RadioConfig, parse_float,
+)
 from .dsp import u8_to_complex
 
 CHUNK_SAMPLES = 131_072   # ~55 ms at 2.4 MS/s; multiple of 256 as librtlsdr requires
@@ -250,6 +253,18 @@ SIGMF_TYPES = {
 }
 
 _HZ_RE = re.compile(r"(\d{5,11})\s*Hz", re.IGNORECASE)
+MAX_META_BYTES = 1024 * 1024
+
+
+def _meta_number(value, lo: float, hi: float) -> Optional[float]:
+    """A metadata number, or None if missing / not a number / out of range."""
+    if value is None:
+        return None
+    try:
+        v = parse_float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if lo <= v <= hi else None
 
 
 @dataclass
@@ -264,39 +279,64 @@ class FileInfo:
     data_path: Optional[Path] = None
 
 
+def _read_wav(p: Path):
+    """scipy's WAV reader, memory-mapped, with its warnings silenced and errors normalised."""
+    import warnings
+    from scipy.io import wavfile
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            return wavfile.read(str(p), mmap=True)
+        except (OSError, ValueError):
+            raise
+        except Exception as e:          # struct.error, ZeroDivisionError, ... on corrupt headers
+            raise ValueError(f"corrupt WAV file ({type(e).__name__})") from e
+
+
 def inspect_iq_file(path: str | Path) -> FileInfo:
     """Work out format, centre frequency and sample rate of an IQ recording."""
     p = Path(path)
     suffix = p.suffix.lower()
     if suffix in (".sigmf-meta", ".sigmf-data"):
         meta_path = Path(sigmf_base(p) + ".sigmf-meta")
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        g = meta.get("global", {})
+        if meta_path.stat().st_size > MAX_META_BYTES:
+            raise ValueError("SigMF metadata file is too large")
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as e:
+            raise ValueError(f"Invalid SigMF metadata: {e}") from e
+        g = meta.get("global") if isinstance(meta, dict) else None
+        if not isinstance(g, dict):
+            raise ValueError("Invalid SigMF metadata: no 'global' object")
         dt = g.get("core:datatype", "cu8")
         if dt not in SIGMF_TYPES:
             raise ValueError(f"Unsupported SigMF datatype {dt!r}")
-        caps = meta.get("captures") or [{}]
+        caps = meta.get("captures")
+        cap = caps[0] if isinstance(caps, list) and caps and isinstance(caps[0], dict) else {}
         dtype, scale, offset = SIGMF_TYPES[dt]
-        return FileInfo(p, "sigmf", caps[0].get("core:frequency"), g.get("core:sample_rate"),
+        return FileInfo(p, "sigmf",
+                        _meta_number(cap.get("core:frequency"), MIN_FREQ, MAX_FREQ),
+                        _meta_number(g.get("core:sample_rate"), MIN_FILE_RATE, MAX_FILE_RATE),
                         dtype, scale, offset, Path(sigmf_base(p) + ".sigmf-data"))
 
     center = None
     m = _HZ_RE.search(p.name)
     if m:
-        center = float(m.group(1))
+        center = _meta_number(m.group(1), MIN_FREQ, MAX_FREQ)
     if suffix == ".wav":
-        from scipy.io import wavfile
-        rate, data = wavfile.read(str(p), mmap=True)
+        rate, data = _read_wav(p)
         if data.ndim != 2 or data.shape[1] != 2:
             raise ValueError("WAV IQ files must have two channels (I and Q)")
-        return FileInfo(p, "wav", center, float(rate), data.dtype, 1.0, 0.0, p)
+        return FileInfo(p, "wav", center, _meta_number(rate, MIN_FILE_RATE, MAX_FILE_RATE),
+                        data.dtype, 1.0, 0.0, p)
     if suffix not in RAW_FORMATS:
         raise ValueError(f"Unknown IQ file type {suffix!r}")
     dtype, scale, offset = RAW_FORMATS[suffix]
     rate = None
     m = re.search(r"(\d+(?:\.\d+)?)\s*(M|k)sps", p.name, re.IGNORECASE)
     if m:
-        rate = float(m.group(1)) * (1e6 if m.group(2).lower() == "m" else 1e3)
+        rate = _meta_number(float(m.group(1)) * (1e6 if m.group(2).lower() == "m" else 1e3),
+                            MIN_FILE_RATE, MAX_FILE_RATE)
     return FileInfo(p, "raw", center, rate, dtype, scale, offset, p)
 
 
@@ -322,17 +362,30 @@ class FileSource(IQSource):
         p = Path(self.cfg.file_path)
         if not p.exists():
             raise RuntimeError(f"IQ file not found: {p}")
-        info = inspect_iq_file(p)
+        try:
+            info = inspect_iq_file(p)
+        except Exception as e:          # malformed files can make parsers raise anything
+            raise RuntimeError(f"Cannot read IQ file {p.name}: {e or type(e).__name__}") from e
         self.info = info
-        self.center = float(info.center or self.cfg.file_center or 0.0)
-        self.sample_rate = float(info.sample_rate or self.cfg.file_rate or 0.0)
-        if self.center <= 0 or self.sample_rate <= 0:
+        # Real metadata (SigMF, WAV header) wins; a value typed in Settings beats a
+        # centre frequency guessed from the file name.
+        if info.kind == "sigmf" and info.center:
+            center = info.center
+        else:
+            center = self.cfg.file_center or info.center or 0.0
+        rate = info.sample_rate or self.cfg.file_rate or 0.0
+        if not center or not rate:
             raise RuntimeError(
                 "The IQ file's centre frequency / sample rate are unknown. "
                 "Enter them in Settings > Source.")
+        if not (MIN_FREQ <= center <= MAX_FREQ and MIN_FILE_RATE <= rate <= MAX_FILE_RATE):
+            raise RuntimeError(f"Unsupported IQ file parameters: centre {center:g} Hz, rate {rate:g} S/s")
+        self.center, self.sample_rate = float(center), float(rate)
         if info.kind == "wav":
-            from scipy.io import wavfile
-            _, data = wavfile.read(str(p), mmap=True)
+            try:
+                _, data = _read_wav(p)
+            except Exception as e:
+                raise RuntimeError(f"Cannot read IQ file {p.name}: {e or type(e).__name__}") from e
             self._data = data.reshape(-1)
             if data.dtype == np.uint8:
                 self._scale, self._offset = 1 / 128.0, 128.0

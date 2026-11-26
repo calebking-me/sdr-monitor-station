@@ -25,6 +25,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -36,6 +38,7 @@ jobs:
         if: env.RELEASE_TAG != ''
         shell: pwsh
         run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$') { throw "Release tag must look like v1.2.3" }
           $v = (python -c "import sdrscanner; print(sdrscanner.__version__)").Trim()
           if ("v$v" -ne $env:RELEASE_TAG) { throw "Release tag $env:RELEASE_TAG does not match sdrscanner.__version__ ($v)" }
 
@@ -73,10 +76,19 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: SDRScanner-win64
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          target_commitish: ${{ github.sha }}
-          name: SDR Scanner ${{ env.RELEASE_TAG }}
-          files: SDRScanner-*-win64.zip
-          generate_release_notes: true
+      # GitHub's own CLI (preinstalled on the runner) rather than a third-party action:
+      # this job has write access, so it runs no code from outside GitHub.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Refusing to release unexpected tag '$RELEASE_TAG'"; exit 1
+          fi
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" SDRScanner-*-win64.zip --clobber
+          else
+            gh release create "$RELEASE_TAG" SDRScanner-*-win64.zip --target "$GITHUB_SHA" \
+              --title "SDR Scanner $RELEASE_TAG" --generate-notes
+          fi

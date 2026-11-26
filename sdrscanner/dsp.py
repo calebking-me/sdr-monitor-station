@@ -1,33 +1,33 @@
-"""Signal processing: channelizer, FM demodulator, squelch, CTCSS detection.
+"""Signal processing: channelizer, FM/AM demodulation, squelch, CTCSS detection.
 
 Channelization uses a fast-convolution (overlap-save) filter bank. One large
 FFT of the wideband IQ is shared by every channel; each channel then selects
 the FFT bins around its frequency, applies its low-pass filter in the
 frequency domain and runs a small inverse FFT. Selecting only `nc` of `n` bins
-decimates the channel straight down to the audio rate (48 kHz), so adding a
-channel costs one small IFFT instead of a full-rate mixer and FIR filter.
+decimates the channel straight down to the audio rate (48 kHz).
+
+All channels are processed together as rows of matrices (`ChannelBank`): one
+batched IFFT, one batched discriminator, one batched voice filter, and so on.
+The per-frame cost is therefore almost independent of the number of channels,
+which matters for presets such as the 40 CB channels.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from fractions import Fraction
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import scipy.fft as sfft
 from scipy import signal
 
-AUDIO_RATE = 48_000
+from .config import CTCSS_TONES, MODE_AM, MODE_FM  # noqa: F401  (CTCSS_TONES re-exported)
 
-CTCSS_TONES = (
-    67.0, 69.3, 71.9, 74.4, 77.0, 79.7, 82.5, 85.4, 88.5, 91.5, 94.8, 97.4,
-    100.0, 103.5, 107.2, 110.9, 114.8, 118.8, 123.0, 127.3, 131.8, 136.5,
-    141.3, 146.2, 150.0, 151.4, 156.7, 159.8, 162.2, 165.5, 167.9, 171.3,
-    173.8, 177.3, 179.9, 183.5, 186.2, 189.9, 192.8, 196.6, 199.5, 203.5,
-    206.5, 210.7, 218.1, 225.7, 229.1, 233.6, 241.8, 250.3, 254.1,
-)
+AUDIO_RATE = 48_000
+HEADROOM = 0.5         # full deviation / 100% AM -> -6 dBFS audio, leaves room for mixing
 
 
 def _largest_prime_factor(n: int) -> int:
@@ -46,6 +46,8 @@ def choose_fft_sizes(fs: float, out_rate: int = AUDIO_RATE) -> tuple[int, int]:
     nc must be a multiple of 4*q (q = denominator of fs/out_rate) so that the
     75% hop is an integer number of samples at both rates.
     """
+    if not (math.isfinite(fs) and 60_000 <= fs <= 100e6):
+        raise ValueError(f"unsupported sample rate {fs!r}")
     ratio = Fraction(int(round(fs)), out_rate).limit_denominator(64)
     p, q = ratio.numerator, ratio.denominator
     step = 4 * q
@@ -62,37 +64,8 @@ def choose_fft_sizes(fs: float, out_rate: int = AUDIO_RATE) -> tuple[int, int]:
     return best[1], best[2]
 
 
-class ChannelTap:
-    """Extracts one channel from the shared FFT frames."""
-
-    def __init__(self, chz: "Channelizer", offset_hz: float, cutoff_hz: float):
-        self.offset_hz = offset_hz
-        n, nc = chz.n, chz.nc
-        self.k0 = int(round(offset_hz * n / chz.fs))
-        residual = offset_hz - self.k0 * chz.fs / n
-        bins = np.fft.fftfreq(nc, 1.0 / nc).astype(np.int64)
-        self.idx = (self.k0 + bins) % n
-        ntaps = min(chz.nc - chz.hop_c - 1, 255) | 1
-        taps = signal.firwin(ntaps, cutoff_hz, fs=chz.rate, window=("kaiser", 7.0))
-        self.H = (sfft.fft(taps, nc) * (nc / n)).astype(np.complex64)
-        # Per-frame phase correction makes the bin shift equivalent to a continuous mixer.
-        self._k0_hop = (self.k0 * chz.hop) % n
-        # Fine NCO removes the residual (< half a bin) frequency error.
-        self._nco_step = -residual / chz.rate
-        self._nco_phase = 0.0
-        self._ramp = np.arange(chz.hop_c, dtype=np.float64)
-
-    def extract(self, X: np.ndarray, frame_index: int, chz: "Channelizer") -> np.ndarray:
-        y = sfft.ifft(X[self.idx] * self.H)[chz.overlap_c:]
-        ph = (self._k0_hop * (frame_index % chz.n)) % chz.n / chz.n
-        cycles = self._nco_phase - ph + self._nco_step * self._ramp
-        y = y * np.exp(2j * np.pi * cycles).astype(np.complex64)
-        self._nco_phase = (self._nco_phase + self._nco_step * chz.hop_c) % 1.0
-        return y.astype(np.complex64, copy=False)
-
-
 class Channelizer:
-    """Overlap-save fast-convolution channelizer (75% hop)."""
+    """Overlap-save fast-convolution front end (75% hop)."""
 
     def __init__(self, fs: float, center: float):
         self.fs = float(fs)
@@ -106,15 +79,12 @@ class Channelizer:
         self._buf = np.zeros(self.n - self.hop, dtype=np.complex64)
         self._frame_index = 0
 
-    def max_offset(self, bandwidth: float) -> float:
+    def max_offset(self) -> float:
         """Largest |offset| at which a channel's bins do not wrap around."""
         return self.fs / 2 - self.rate / 2
 
-    def make_tap(self, freq_hz: float, cutoff_hz: float) -> Optional[ChannelTap]:
-        off = freq_hz - self.center
-        if abs(off) > self.max_offset(cutoff_hz):
-            return None
-        return ChannelTap(self, off, cutoff_hz)
+    def accepts(self, freq_hz: float) -> bool:
+        return abs(freq_hz - self.center) <= self.max_offset()
 
     def frames(self, x: np.ndarray):
         """Yield (frame_index, X) for every complete frame available."""
@@ -128,116 +98,17 @@ class Channelizer:
         self._buf = buf[pos:].copy()
 
 
-def channel_cutoff(bandwidth: float) -> float:
-    """Channel filter cutoff (one-sided) for a 12.5 or 25 kHz channel."""
-    return 5_500.0 if bandwidth <= 12_500 else 8_500.0
+def channel_cutoff(bandwidth: float, mode: str = MODE_FM) -> float:
+    """One-sided channel filter cutoff for a channel of the given width."""
+    if mode == MODE_AM:
+        return max(1_500.0, bandwidth / 2)
+    if bandwidth <= 12_500:
+        return 0.44 * bandwidth                       # 12.5 kHz -> 5.5 kHz
+    return 5_500.0 + (bandwidth - 12_500.0) * 0.24    # 25 kHz -> 8.5 kHz
 
 
 def nominal_deviation(bandwidth: float) -> float:
-    return 2_500.0 if bandwidth <= 12_500 else 5_000.0
-
-
-class FMDemod:
-    """Quadrature FM discriminator with de-emphasis and voice band-pass."""
-
-    HEADROOM = 0.5     # full deviation -> -6 dBFS audio, leaves room for mixing channels
-
-    def __init__(self, rate: float, bandwidth: float, deemphasis_us: float = 750.0):
-        self.rate = rate
-        self.scale = rate / (2 * np.pi * nominal_deviation(bandwidth))
-        self._prev = np.complex64(1.0)
-        self.deemph = deemphasis_us > 0
-        if self.deemph:
-            alpha = 1.0 - math.exp(-1.0 / (rate * deemphasis_us * 1e-6))
-            self._de_b = np.array([alpha])
-            self._de_a = np.array([1.0, alpha - 1.0])
-            # Normalise gain to 0 dB at 1 kHz.
-            _, h = signal.freqz(self._de_b, self._de_a, worN=[1000.0], fs=rate)
-            self._de_b = self._de_b / abs(h[0])
-            self._de_zi = np.zeros(1)
-        self._voice_sos = signal.butter(4, [300.0, 3000.0], btype="bandpass", fs=rate, output="sos")
-        self._voice_zi = np.zeros((self._voice_sos.shape[0], 2))
-
-    def discriminate(self, y: np.ndarray) -> np.ndarray:
-        """Raw instantaneous frequency, scaled so nominal deviation = 1.0."""
-        prev = np.concatenate(([self._prev], y[:-1]))
-        self._prev = y[-1]
-        return (np.angle(y * np.conj(prev)) * self.scale).astype(np.float64)
-
-    def audio(self, d: np.ndarray) -> np.ndarray:
-        if self.deemph:
-            d, self._de_zi = signal.lfilter(self._de_b, self._de_a, d, zi=self._de_zi)
-        a, self._voice_zi = signal.sosfilt(self._voice_sos, d, zi=self._voice_zi)
-        return (a * self.HEADROOM).astype(np.float32)
-
-
-class CtcssDetector:
-    """Detects sub-audible CTCSS tones in the discriminator output."""
-
-    WINDOW_S = 0.5
-    OPEN_RATIO = 0.35
-    CLOSE_RATIO = 0.2
-    CONFIRM = 3        # consecutive agreeing estimates (~0.25 s) before reporting a tone
-
-    def __init__(self, rate: float):
-        self.dec = max(1, int(round(rate / 3000.0)))
-        self.rate = rate / self.dec
-        self._sos = signal.butter(4, 270.0, fs=rate, output="sos")
-        self._zi = np.zeros((self._sos.shape[0], 2))
-        self._phase = 0
-        self._n = int(self.WINDOW_S * self.rate)
-        self._hist = np.zeros(self._n)
-        self._filled = 0
-        self._win = np.hanning(self._n)
-        t = np.arange(self._n) / self.rate
-        tones = np.asarray(CTCSS_TONES)
-        self._basis = (np.exp(-2j * np.pi * np.outer(tones, t)) * self._win).astype(np.complex128)
-        self._norm_amp = (self._win.sum() / 2) ** 2
-        self._norm_pow = (self._win ** 2).sum() / 2
-        self.tone: Optional[float] = None    # currently detected tone
-        self.ratio = 0.0
-        self._counter = 0
-        self._candidate: Optional[float] = None
-        self._streak = 0
-
-    def update(self, d: np.ndarray) -> Optional[float]:
-        lp, self._zi = signal.sosfilt(self._sos, d, zi=self._zi)
-        dec = lp[self._phase::self.dec]
-        self._phase = (self._phase - len(d)) % self.dec
-        k = len(dec)
-        if k >= self._n:
-            self._hist[:] = dec[-self._n:]
-        else:
-            self._hist[:-k] = self._hist[k:]
-            self._hist[-k:] = dec
-        self._filled = min(self._n, self._filled + k)
-        self._counter += 1
-        if self._filled < self._n or self._counter % 4:
-            return self.tone
-        x = self._hist - self._hist.mean()
-        powers = np.abs(self._basis @ x) ** 2 / self._norm_amp   # amplitude^2 per tone
-        total = (np.square(x * self._win)).sum() / self._norm_pow  # amplitude^2 of everything
-        i = int(np.argmax(powers))
-        self.ratio = float(powers[i] / total) if total > 1e-12 else 0.0
-        best = CTCSS_TONES[i]
-        if self.ratio >= self.OPEN_RATIO and best == self._candidate:
-            self._streak += 1
-        else:
-            self._candidate = best if self.ratio >= self.OPEN_RATIO else None
-            self._streak = 1 if self._candidate else 0
-        if self.tone is not None and self.tone == best:
-            if self.ratio < self.CLOSE_RATIO:
-                self.tone = None
-        elif self._streak >= self.CONFIRM:
-            self.tone = best
-        elif self.tone is not None and (self.ratio < self.CLOSE_RATIO or best != self.tone):
-            self.tone = None
-        return self.tone
-
-    def reset(self):
-        self.tone = None
-        self._filled = 0
-        self._candidate, self._streak = None, 0
+    return 2_500.0 if bandwidth < 18_000 else 5_000.0
 
 
 class Squelch:
@@ -263,6 +134,258 @@ class Squelch:
 
 
 @dataclass
+class _Row:
+    """Per-channel scalar state; survives bank rebuilds while the channel's key is unchanged."""
+    cfg: Any
+    key: tuple
+    squelch: Squelch = field(default_factory=Squelch)
+    noise_db: float = -100.0
+    noise_init: bool = False
+    gain: float = 0.0
+    tone: Optional[float] = None
+    candidate: Optional[float] = None
+    streak: int = 0
+    filled: int = 0
+
+
+@dataclass
+class BankFrame:
+    audio: np.ndarray        # (C, hop) float32, squelch-gated, before volume/pan
+    rssi: np.ndarray         # (C,) dBFS
+    noise: np.ndarray        # (C,) dBFS noise-floor estimate
+    open: list[bool]
+    carrier: list[bool]
+    tones: list[Optional[float]]
+
+
+class ChannelBank:
+    """Receives every channel of one Channelizer as rows of shared matrices."""
+
+    CT_WINDOW_S = 0.5
+    CT_OPEN_RATIO = 0.35
+    CT_CLOSE_RATIO = 0.2
+    CT_CONFIRM = 3           # consecutive agreeing estimates (~0.25 s) before reporting a tone
+    CT_EVERY = 4             # evaluate tones every 4th frame (~16 Hz)
+
+    def __init__(self, chz: Channelizer, cfgs: Sequence[Any], previous: Optional["ChannelBank"] = None):
+        self.chz = chz
+        n, nc, hop = chz.n, chz.nc, chz.hop_c
+        rate = chz.rate
+        self.rejected: list[Any] = [c for c in cfgs if not chz.accepts(c.frequency)]
+        cfgs = [c for c in cfgs if chz.accepts(c.frequency)]
+        C = len(cfgs)
+        self.rows: list[_Row] = []
+        prev_map = {}
+        if previous is not None and previous.chz is chz:
+            prev_map = {r.key: i for i, r in enumerate(previous.rows)}
+
+        self.modes = [c.mode for c in cfgs]
+        self.am_idx = np.array([i for i, c in enumerate(cfgs) if c.mode == MODE_AM], dtype=np.int64)
+        self.fm_mask = np.array([c.mode != MODE_AM for c in cfgs], dtype=bool)
+
+        off = np.array([c.frequency - chz.center for c in cfgs], dtype=np.float64)
+        k0 = np.round(off * n / chz.fs).astype(np.int64)
+        residual = off - k0 * chz.fs / n
+        bins = np.fft.fftfreq(nc, 1.0 / nc).astype(np.int64)
+        self.idx = (k0[:, None] + bins[None, :]) % n
+        self.k0_hop = (k0 * chz.hop) % n
+        self.nco_step = -residual / rate
+        ramp = np.arange(hop, dtype=np.float64)
+        self.nco_rot = np.exp(2j * np.pi * self.nco_step[:, None] * ramp[None, :]).astype(np.complex64)
+        self.ramp01 = np.linspace(0.0, 1.0, hop, dtype=np.float32)
+
+        ntaps = min(nc - hop - 1, 255) | 1
+        cache: dict[float, np.ndarray] = {}
+        H = np.empty((C, nc), dtype=np.complex64)
+        for i, c in enumerate(cfgs):
+            cut = channel_cutoff(c.bandwidth, c.mode)
+            if cut not in cache:
+                taps = signal.firwin(ntaps, cut, fs=rate, window=("kaiser", 7.0))
+                cache[cut] = (sfft.fft(taps, nc) * (nc / n)).astype(np.complex64)
+            H[i] = cache[cut]
+        self.H = H
+        self.scale = np.array([rate / (2 * np.pi * nominal_deviation(c.bandwidth)) for c in cfgs],
+                              dtype=np.float32)
+
+        # De-emphasis: one-pole low-pass per distinct time constant (FM rows only).
+        groups: dict[float, list[int]] = {}
+        for i, c in enumerate(cfgs):
+            if c.mode != MODE_AM and c.deemphasis_us > 0:
+                groups.setdefault(float(c.deemphasis_us), []).append(i)
+        self.deemph = []
+        for tau, rows in groups.items():
+            alpha = 1.0 - math.exp(-1.0 / (rate * tau * 1e-6))
+            b, a = np.array([alpha]), np.array([1.0, alpha - 1.0])
+            _, h = signal.freqz(b, a, worN=[1000.0], fs=rate)   # 0 dB at 1 kHz
+            self.deemph.append((b / abs(h[0]), a, np.array(rows, dtype=np.int64)))
+        self.de_zi = np.zeros((C, 1))
+
+        self.voice_sos = signal.butter(4, [300.0, 3000.0], btype="bandpass", fs=rate, output="sos")
+        self.voice_zi = np.zeros((self.voice_sos.shape[0], C, 2))
+
+        self.ct_dec = max(1, int(round(rate / 3000.0)))
+        ct_rate = rate / self.ct_dec
+        self.ct_sos = signal.butter(4, 270.0, fs=rate, output="sos")
+        self.ct_zi = np.zeros((self.ct_sos.shape[0], C, 2))
+        self.ct_n = int(self.CT_WINDOW_S * ct_rate)
+        self.ct_hist = np.zeros((C, self.ct_n))
+        self.ct_win = np.hanning(self.ct_n)
+        t = np.arange(self.ct_n) / ct_rate
+        self.ct_basis = (np.exp(-2j * np.pi * np.outer(CTCSS_TONES, t)) * self.ct_win).T  # (n, tones)
+        self.ct_norm_amp = (self.ct_win.sum() / 2) ** 2
+        self.ct_norm_pow = (self.ct_win ** 2).sum() / 2
+        self.ct_phase = previous.ct_phase if prev_map else 0
+        self.ct_counter = previous.ct_counter if prev_map else 0
+
+        self.nco_phase = np.zeros(C)
+        self.prev = np.ones(C, dtype=np.complex64)
+        self.am_carrier = np.zeros(C)
+
+        for i, c in enumerate(cfgs):
+            key = c.dsp_key()
+            j = prev_map.get(key)
+            if j is None:
+                self.rows.append(_Row(cfg=c, key=key))
+                continue
+            old = previous.rows[j]
+            old.cfg = c
+            self.rows.append(old)
+            self.nco_phase[i] = previous.nco_phase[j]
+            self.prev[i] = previous.prev[j]
+            self.am_carrier[i] = previous.am_carrier[j]
+            self.de_zi[i] = previous.de_zi[j]
+            self.voice_zi[:, i] = previous.voice_zi[:, j]
+            self.ct_zi[:, i] = previous.ct_zi[:, j]
+            self.ct_hist[i] = previous.ct_hist[j]
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def ids(self) -> list[str]:
+        return [r.cfg.id for r in self.rows]
+
+    # ------------------------------------------------------------------ processing
+    def process(self, X: np.ndarray, frame_index: int) -> BankFrame:
+        chz = self.chz
+        C, hop, n = len(self.rows), chz.hop_c, chz.n
+        if C == 0:
+            e = np.zeros((0, hop), dtype=np.float32)
+            return BankFrame(e, np.zeros(0), np.zeros(0), [], [], [])
+
+        # Extract every channel: gather bins, filter, batched inverse FFT.
+        y = sfft.ifft(X[self.idx] * self.H, axis=1)[:, chz.overlap_c:]
+        ph = ((self.k0_hop * (frame_index % n)) % n) / n
+        rot = np.exp(2j * np.pi * (self.nco_phase - ph)).astype(np.complex64)
+        y = (y * self.nco_rot) * rot[:, None]
+        self.nco_phase = (self.nco_phase + self.nco_step * hop) % 1.0
+
+        power = np.mean(y.real ** 2 + y.imag ** 2, axis=1)
+        rssi = 10.0 * np.log10(power + 1e-20)
+
+        # FM discriminator for all rows (AM rows are overwritten below).
+        prev = np.concatenate((self.prev[:, None], y[:, :-1]), axis=1)
+        self.prev = y[:, -1].copy()
+        d = (np.angle(y * np.conj(prev)) * self.scale[:, None]).astype(np.float64)
+
+        s = d.copy()
+        for b, a, rows in self.deemph:
+            s[rows], self.de_zi[rows] = signal.lfilter(b, a, d[rows], axis=1, zi=self.de_zi[rows])
+        if len(self.am_idx):
+            s[self.am_idx] = self._am_detect(y[self.am_idx])
+
+        audio, self.voice_zi = signal.sosfilt(self.voice_sos, s, axis=1, zi=self.voice_zi)
+        audio = (audio * HEADROOM).astype(np.float32)
+
+        self._ctcss(d)
+
+        # Noise floor: fast down, slow up.
+        rssi_l = rssi.tolist()
+        opened, carrier, tones, targets = [], [], [], np.empty(C, dtype=np.float32)
+        gains = np.empty(C, dtype=np.float32)
+        noise = np.empty(C)
+        dt = chz.frame_seconds
+        for i, r in enumerate(self.rows):
+            v = rssi_l[i]
+            if not r.noise_init:
+                r.noise_db, r.noise_init = v, True
+            else:
+                r.noise_db += (0.25 if v < r.noise_db else 0.002) * (v - r.noise_db)
+            noise[i] = r.noise_db
+            cfg = r.cfg
+            is_fm = self.modes[i] != MODE_AM
+            tone = r.tone if is_fm else None
+            tone_ok = True
+            if is_fm and cfg.ctcss_hz:
+                tone_ok = tone is not None and abs(tone - cfg.ctcss_hz) < 0.6
+            is_open = r.squelch.update(v, cfg.squelch_db, cfg.hysteresis_db, cfg.hang_time, tone_ok, dt)
+            gains[i] = r.gain
+            targets[i] = 1.0 if is_open else 0.0
+            r.gain = float(targets[i])
+            opened.append(is_open)
+            carrier.append(r.squelch.carrier)
+            tones.append(tone)
+
+        g = gains[:, None] + (targets - gains)[:, None] * self.ramp01[None, :]
+        audio *= g
+        return BankFrame(audio, rssi, noise, opened, carrier, tones)
+
+    def _am_detect(self, y: np.ndarray) -> np.ndarray:
+        """Envelope detector with carrier-tracking AGC: output = modulation index."""
+        env = np.abs(y)                       # float32
+        m = env.mean(axis=1, dtype=np.float64)
+        old = self.am_carrier[self.am_idx]
+        reset = (old <= 0) | (m > 2.0 * old) | (m < 0.5 * old)
+        new = np.where(reset, m, old + 0.25 * (m - old))
+        start = np.where(reset, m, old)
+        car = (start[:, None] + (new - start)[:, None] * self.ramp01[None, :]).astype(np.float32)
+        self.am_carrier[self.am_idx] = new
+        return env / np.maximum(car, np.float32(1e-9)) - np.float32(1.0)
+
+    def _ctcss(self, d: np.ndarray) -> None:
+        if not self.fm_mask.any():
+            return
+        lp, self.ct_zi = signal.sosfilt(self.ct_sos, d, axis=1, zi=self.ct_zi)
+        dec = lp[:, self.ct_phase::self.ct_dec]
+        self.ct_phase = (self.ct_phase - d.shape[1]) % self.ct_dec
+        k = dec.shape[1]
+        if k >= self.ct_n:
+            self.ct_hist[:] = dec[:, -self.ct_n:]
+        elif k:
+            self.ct_hist[:, :-k] = self.ct_hist[:, k:]
+            self.ct_hist[:, -k:] = dec
+        for r in self.rows:
+            r.filled = min(self.ct_n, r.filled + k)
+        self.ct_counter += 1
+        if self.ct_counter % self.CT_EVERY:
+            return
+        ready = [i for i, r in enumerate(self.rows) if r.filled >= self.ct_n and self.fm_mask[i]]
+        if not ready:
+            return
+        x = self.ct_hist[ready]
+        x = x - x.mean(axis=1, keepdims=True)
+        powers = np.abs(x @ self.ct_basis) ** 2 / self.ct_norm_amp          # (R, tones)
+        total = np.square(x * self.ct_win).sum(axis=1) / self.ct_norm_pow   # (R,)
+        best = np.argmax(powers, axis=1)
+        for j, i in enumerate(ready):
+            ratio = float(powers[j, best[j]] / total[j]) if total[j] > 1e-12 else 0.0
+            self._tone_state(self.rows[i], CTCSS_TONES[int(best[j])], ratio)
+
+    def _tone_state(self, r: _Row, best: float, ratio: float) -> None:
+        if ratio >= self.CT_OPEN_RATIO and best == r.candidate:
+            r.streak += 1
+        else:
+            r.candidate = best if ratio >= self.CT_OPEN_RATIO else None
+            r.streak = 1 if r.candidate else 0
+        if r.tone is not None and r.tone == best:
+            if ratio < self.CT_CLOSE_RATIO:
+                r.tone = None
+        elif r.streak >= self.CT_CONFIRM:
+            r.tone = best
+        elif r.tone is not None and (ratio < self.CT_CLOSE_RATIO or best != r.tone):
+            r.tone = None
+
+
+@dataclass
 class ChannelFrame:
     audio: np.ndarray        # mono float32, squelch-gated, before volume/pan
     rssi_db: float
@@ -273,57 +396,26 @@ class ChannelFrame:
 
 
 class ChannelProcessor:
-    """Full per-channel receive chain operating on channelizer frames."""
+    """Single-channel convenience wrapper around ChannelBank (tests, self-test)."""
 
     def __init__(self, chz: Channelizer, cfg):
-        self.cfg = cfg   # ChannelConfig, read live for squelch/tone parameters
-        self.tap = chz.make_tap(cfg.frequency, channel_cutoff(cfg.bandwidth))
-        self.rate = chz.rate
-        self.dt = chz.frame_seconds
-        self.demod = FMDemod(chz.rate, cfg.bandwidth, cfg.deemphasis_us)
-        self.ctcss = CtcssDetector(chz.rate)
-        self.squelch = Squelch()
-        self.noise_db = -100.0
-        self._noise_init = False
-        self._gain = 0.0
-        self._ramp = np.linspace(0.0, 1.0, chz.hop_c, dtype=np.float32)
+        self.cfg = cfg
+        self.bank = ChannelBank(chz, [cfg])
 
     @property
     def valid(self) -> bool:
-        return self.tap is not None
+        return len(self.bank) == 1
 
-    def process(self, X: np.ndarray, frame_index: int, chz: Channelizer) -> ChannelFrame:
-        y = self.tap.extract(X, frame_index, chz)
-        p = float(np.mean(y.real ** 2 + y.imag ** 2))
-        rssi = 10.0 * math.log10(p + 1e-20)
-        if not self._noise_init:
-            self.noise_db, self._noise_init = rssi, True
-        else:
-            k = 0.25 if rssi < self.noise_db else 0.002
-            self.noise_db += k * (rssi - self.noise_db)
+    def process(self, X: np.ndarray, frame_index: int, chz: Optional[Channelizer] = None) -> ChannelFrame:
+        f = self.bank.process(X, frame_index)
+        return ChannelFrame(f.audio[0], float(f.rssi[0]), float(f.noise[0]), f.open[0], f.carrier[0], f.tones[0])
 
-        d = self.demod.discriminate(y)
-        cfg = self.cfg
-        tone = self.ctcss.update(d)
-        tone_ok = True
-        if cfg.ctcss_hz:
-            tone_ok = tone is not None and abs(tone - cfg.ctcss_hz) < 0.6
-        was_open = self.squelch.open
-        is_open = self.squelch.update(rssi, cfg.squelch_db, cfg.hysteresis_db,
-                                      cfg.hang_time, tone_ok, self.dt)
-        if not is_open and not was_open and self._gain == 0.0:
-            audio = np.zeros(len(y), dtype=np.float32)
-            # Keep filter state warm so the next opening is click-free.
-            self.demod.audio(d)
-        else:
-            audio = self.demod.audio(d)
-            target = 1.0 if is_open else 0.0
-            if target != self._gain:
-                audio *= self._gain + (target - self._gain) * self._ramp
-                self._gain = target
-            elif target == 0.0:
-                audio[:] = 0.0
-        return ChannelFrame(audio, rssi, self.noise_db, is_open, self.squelch.carrier, tone)
+
+@lru_cache(maxsize=8)
+def _spectrum_window(nfft: int) -> tuple[np.ndarray, float]:
+    win = np.blackman(nfft).astype(np.float32)
+    win.setflags(write=False)
+    return win, float(win.sum() ** 2)
 
 
 def spectrum_db(x: np.ndarray, nfft: int = 2048, max_avg: int = 16) -> np.ndarray:
@@ -334,14 +426,16 @@ def spectrum_db(x: np.ndarray, nfft: int = 2048, max_avg: int = 16) -> np.ndarra
         count = 1
     step = len(x) // count
     segs = np.stack([x[i * step:i * step + nfft] for i in range(count)])
-    win = np.blackman(nfft).astype(np.float32)
+    win, norm = _spectrum_window(nfft)
     X = sfft.fft(segs * win, axis=1)
-    p = np.mean(np.abs(X) ** 2, axis=0) / (win.sum() ** 2)
+    p = np.mean(X.real ** 2 + X.imag ** 2, axis=0) / norm
     return sfft.fftshift(10 * np.log10(p + 1e-20)).astype(np.float32)
 
 
 def u8_to_complex(buf: np.ndarray) -> np.ndarray:
     """Convert interleaved unsigned 8-bit IQ (RTL-SDR native) to complex64."""
+    if len(buf) % 2:
+        buf = buf[:-1]
     f = buf.astype(np.float32)
     f -= 127.4
     f *= 1.0 / 128.0

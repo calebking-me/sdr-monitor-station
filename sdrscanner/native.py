@@ -25,16 +25,19 @@ def is_frozen() -> bool:
 
 
 def app_dirs() -> list[Path]:
-    """Folders where a user-supplied librtlsdr may be placed."""
-    dirs = []
+    """Folders where a user-supplied librtlsdr may be placed.
+
+    Only the application's own folder: the folder holding SDRScanner.exe, or the
+    root of a source checkout. The current working directory is deliberately NOT
+    searched - loading a DLL from it would let a planted rtlsdr.dll in, say, the
+    Downloads folder run code when the app is started from there (DLL hijacking).
+    """
     if is_frozen():
-        dirs.append(Path(sys.executable).resolve().parent)
-    else:
-        dirs.append(Path(__file__).resolve().parents[1])   # project root
-    cwd = Path.cwd()
-    if cwd not in dirs:
-        dirs.append(cwd)
-    return dirs
+        return [Path(sys.executable).resolve().parent]
+    root = Path(__file__).resolve().parents[1]
+    if (root / "run_scanner.bat").exists() or (root / "pyproject.toml").exists():
+        return [root]
+    return []          # installed as a package: rely on PATH / pyrtlsdrlib only
 
 
 def prepare_native_libs() -> None:

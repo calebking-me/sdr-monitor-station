@@ -22,12 +22,12 @@ import numpy as np
 
 from .activity import ActivityEvent, IqRecorder, WavRecorder
 from .audio import AudioManager, pan_gains
-from .config import SOURCE_FILE, AppConfig
-from .dsp import Channelizer, ChannelProcessor, spectrum_db
+from .config import AppConfig
+from .dsp import ChannelBank, Channelizer, spectrum_db
 from .planner import Plan, plan_center
 from .sources import CHUNK_SAMPLES, EndOfStream, IQSource, SourceError, make_source
 
-SPECTRUM_FFT = 2048
+SPECTRUM_FFT_SIZES = (1024, 2048, 4096, 8192)
 RECONNECT_DELAY = 2.0
 
 
@@ -68,6 +68,10 @@ class Snapshot:
 
 @dataclass
 class _OpenEvent:
+    key: tuple               # channel's dsp_key when the transmission started
+    name: str
+    frequency: float
+    mode: str
     start: float
     peak: float
     tone: Optional[float]
@@ -89,13 +93,16 @@ class Engine:
         # (channel_id, start, end or None) for the activity timeline
         self.history: deque[tuple[str, float, Optional[float]]] = deque(maxlen=20000)
         self._history_lock = threading.Lock()
+        self._open_events: dict[str, _OpenEvent] = {}
 
         self._center = 0.0
         self._fs = 0.0
         self._source_ok = False
+        self._source_tunable = True
         self._dsp_load = 0.0
         self._dropped = 0
         self._plan: Optional[Plan] = None
+        self.spectrum_fft = 2048          # display FFT size; may be changed while running
 
         self._dirty = threading.Event()
         self._radio_dirty = threading.Event()
@@ -109,12 +116,23 @@ class Engine:
     def running(self) -> bool:
         return self._running
 
+    @property
+    def center(self) -> float:
+        """Current tuned centre frequency (0 if not receiving). Does not consume anything."""
+        return self._center
+
+    @property
+    def sample_rate(self) -> float:
+        return self._fs
+
     def start(self) -> None:
         if self._running:
             return
+        self.stop()                       # join threads left over from a run that ended by itself
         self._running = True
         self._q = queue.Queue(maxsize=24)
         self._dropped = 0
+        self._dsp_load = 0.0
         self.audio = AudioManager(self._message)
         self._dirty.set()
         self._threads = [
@@ -125,14 +143,15 @@ class Engine:
             t.start()
 
     def stop(self) -> None:
-        if not self._running:
-            return
+        """Stop receiving and release the source and audio devices (idempotent)."""
         self._running = False
         for t in self._threads:
-            t.join(timeout=5)
+            if t is not threading.current_thread():
+                t.join(timeout=6)
         self._threads = []
         if self.audio:
             self.audio.close_all()
+            self.audio = None
         self._source_ok = False
 
     def channels_changed(self) -> None:
@@ -154,7 +173,7 @@ class Engine:
         self._messages.append(f"[{stamp}] {text}")
 
     def poll(self) -> Snapshot:
-        """Collect everything new since the last poll (called from the GUI thread)."""
+        """Collect everything new since the last poll (GUI thread). Consumes events/rows/messages."""
         snap = Snapshot()
         with self._lock:
             snap.spectrum_rows = list(self._spectrum)
@@ -172,12 +191,17 @@ class Engine:
         snap.dsp_load = self._dsp_load
         snap.dropped = self._dropped
         snap.plan = self._plan
-        snap.iq_recording = str(self._iq_rec.path) if self._iq_rec else None
+        rec = self._iq_rec
+        snap.iq_recording = str(rec.path) if rec else None
         return snap
 
     def history_snapshot(self) -> list[tuple[str, float, Optional[float]]]:
         with self._history_lock:
             return list(self.history)
+
+    def clear_history(self) -> None:
+        with self._history_lock:
+            self.history = deque((h for h in self.history if h[2] is None), maxlen=20000)
 
     # ----------------------------------------------------------------- planning
     def _initial_center(self) -> float:
@@ -215,6 +239,7 @@ class Engine:
                     except Exception as e:
                         self._source_ok = False
                         self._message(f"Source error: {e}")
+                        src = None
                         self._running = False
                         break
 
@@ -257,7 +282,10 @@ class Engine:
                     except queue.Empty:
                         pass
                     self._dropped += 1
-                    self._q.put_nowait(chunk)
+                    try:
+                        self._q.put_nowait(chunk)
+                    except queue.Full:
+                        pass
         finally:
             if src is not None:
                 src.close()
@@ -276,15 +304,14 @@ class Engine:
             self._running = False
         finally:
             self._close_all_events()
-            if self._iq_rec:
-                self._iq_rec.close()
-                self._iq_rec = None
+            rec, self._iq_rec = self._iq_rec, None
+            if rec:
+                rec.close()
 
     def _dsp_loop_inner(self) -> None:
         chz: Optional[Channelizer] = None
-        procs: dict[str, ChannelProcessor] = {}
-        open_events: dict[str, _OpenEvent] = {}
-        self._open_events = open_events
+        bank: Optional[ChannelBank] = None
+        open_events = self._open_events
         while self._running:
             try:
                 chunk = self._q.get(timeout=0.2)
@@ -296,24 +323,29 @@ class Engine:
             if self._iq_rec is not None:
                 if (self._iq_rec.center, self._iq_rec.sample_rate) != (chunk.center, chunk.fs):
                     self._message("IQ recording stopped (radio retuned)")
-                    self._iq_rec.close()
-                    self._iq_rec = None
+                    rec, self._iq_rec = self._iq_rec, None
+                    rec.close()
                 else:
                     self._iq_rec.write(chunk.samples)
 
             if chz is None or chz.fs != chunk.fs or chz.center != chunk.center:
+                # New tuning: every channel's DSP state starts over.
+                now = time.time()
+                for cid in list(open_events):
+                    self._close_event(cid, now)
                 chz = Channelizer(chunk.fs, chunk.center)
-                procs.clear()
+                bank = None
                 self._dirty.set()
-            if self._dirty.is_set():
+            if self._dirty.is_set() or bank is None:
                 self._dirty.clear()
-                self._rebuild(chz, procs, open_events, chunk)
+                bank = self._rebuild(chz, bank, chunk)
 
-            row = spectrum_db(chunk.samples, SPECTRUM_FFT)
+            nfft = self.spectrum_fft if self.spectrum_fft in SPECTRUM_FFT_SIZES else 2048
+            row = spectrum_db(chunk.samples, nfft)
             with self._lock:
                 self._spectrum.append(row)
 
-            self._process_frames(chz, procs, open_events, chunk.samples)
+            self._process_frames(chz, bank, chunk.samples)
 
             dt = time.perf_counter() - t0
             load = dt / (len(chunk.samples) / chunk.fs)
@@ -325,9 +357,9 @@ class Engine:
             return
         self._iq_request = None
         if self._iq_rec is not None:
-            self._iq_rec.close()
-            self._message(f"IQ recording saved: {self._iq_rec.path}")
-            self._iq_rec = None
+            rec, self._iq_rec = self._iq_rec, None
+            rec.close()
+            self._message(f"IQ recording saved: {rec.path}")
         if req:
             try:
                 self._iq_rec = IqRecorder(Path(req), chunk.fs, chunk.center)
@@ -335,118 +367,119 @@ class Engine:
             except OSError as e:
                 self._message(f"Cannot start IQ recording: {e}")
 
-    def _rebuild(self, chz: Channelizer, procs: dict, open_events: dict, chunk: Chunk) -> None:
-        tunable = getattr(self, "_source_tunable", True)
+    def _rebuild(self, chz: Channelizer, old: Optional[ChannelBank], chunk: Chunk) -> ChannelBank:
+        tunable = self._source_tunable
         plan = self._make_plan(chunk.fs, chunk.center, tunable)
         self._plan = plan
         if tunable and abs(plan.center - chunk.center) > 1:
             self._want_center = plan.center
-        wanted = {}
-        for ch in self.config.channels:
-            if ch.enabled:
-                wanted[ch.id] = ch
+        channels = list(self.config.channels)
+        enabled = [c for c in channels if c.enabled]
+        bank = ChannelBank(chz, enabled, old)
+        live = {r.cfg.id: r.key for r in bank.rows}
+        now = time.time()
+        for cid, ev in list(self._open_events.items()):
+            if live.get(cid) != ev.key:      # removed, disabled, or retuned/re-moded
+                self._close_event(cid, now)
+        rejected = {c.id for c in bank.rejected}
         status = {}
-        for ch_id in list(procs):
-            ch = wanted.get(ch_id)
-            if ch is None or procs[ch_id]._key != ch.dsp_key() or procs[ch_id].cfg is not ch:
-                del procs[ch_id]
-                self._close_event(ch_id, open_events, time.time())
-        for ch in self.config.channels:
+        for ch in channels:
             if not ch.enabled:
                 status[ch.id] = ChannelStatus(state="disabled")
-                continue
-            if ch.id not in procs:
-                p = ChannelProcessor(chz, ch)
-                if not p.valid:
-                    status[ch.id] = ChannelStatus(state="out_of_band")
-                    continue
-                p._key = ch.dsp_key()
-                procs[ch.id] = p
-            status[ch.id] = ChannelStatus()
+            elif ch.id in rejected:
+                status[ch.id] = ChannelStatus(state="out_of_band")
+            else:
+                status[ch.id] = ChannelStatus()
         with self._lock:
             self._status = status
         if self.audio:
-            keys = {ch.audio_device for ch in wanted.values()}
-            self.audio.close_unused(keys)
+            self.audio.close_unused({ch.audio_device for ch in enabled})
+        return bank
 
-    def _process_frames(self, chz: Channelizer, procs: dict, open_events: dict, x: np.ndarray) -> None:
-        cfgs = {cid: p.cfg for cid, p in procs.items()}
-        any_solo = any(c.solo for c in cfgs.values())
+    def _process_frames(self, chz: Channelizer, bank: ChannelBank, x: np.ndarray) -> None:
+        rows = bank.rows
+        cfgs = [r.cfg for r in rows]
+        C = len(cfgs)
         rec_dir = self.config.effective_recordings_dir()
         frame_dur = chz.frame_seconds
-        latest: dict[str, object] = {}
+        open_events = self._open_events
+        last = None
+        devices = sorted({c.audio_device for c in cfgs})
+        dev_rows = {k: np.array([i for i, c in enumerate(cfgs) if c.audio_device == k], dtype=np.int64)
+                    for k in devices}
         for frame_index, X in chz.frames(x):
+            if C == 0:
+                continue
+            f = bank.process(X, frame_index)
+            last = f
             now = time.time()
-            mixes: dict[str, np.ndarray] = {}
-            for cid, p in procs.items():
-                fr = p.process(X, frame_index, chz)
-                cfg = p.cfg
-                latest[cid] = fr
+            for i, cfg in enumerate(cfgs):
+                cid = cfg.id
+                is_open = f.open[i]
                 ev = open_events.get(cid)
-                if fr.open and ev is None:
+                if is_open and ev is None:
                     rec = None
                     if cfg.record:
                         try:
                             rec = WavRecorder(rec_dir, cfg.name, cfg.frequency, now)
                         except OSError as e:
                             self._message(f"Recording failed for {cfg.name}: {e}")
-                    ev = _OpenEvent(now - frame_dur, fr.rssi_db, fr.tone, rec)
+                    ev = _OpenEvent(rows[i].key, cfg.name, cfg.frequency, cfg.mode, now - frame_dur,
+                                    float(f.rssi[i]), f.tones[i], rec)
                     open_events[cid] = ev
                     with self._history_lock:
                         self.history.append((cid, ev.start, None))
-                elif not fr.open and ev is not None:
-                    self._close_event(cid, open_events, now)
+                elif not is_open and ev is not None:
+                    self._close_event(cid, now)
                     ev = None
                 if ev is not None:
-                    ev.peak = max(ev.peak, fr.rssi_db)
-                    if fr.tone:
-                        ev.tone = fr.tone
+                    ev.peak = max(ev.peak, float(f.rssi[i]))
+                    if f.tones[i]:
+                        ev.tone = f.tones[i]
                     if ev.recorder is not None:
-                        ev.recorder.write(fr.audio)
+                        try:
+                            ev.recorder.write(f.audio[i])
+                        except OSError as e:
+                            self._message(f"Recording stopped for {cfg.name}: {e}")
+                            ev.recorder.close()
+                            ev.recorder = None
 
-                audible = (fr.open and not cfg.mute and (cfg.solo or not any_solo)
-                           and cfg.volume > 0)
-                if not audible:
-                    continue
-                left, right = pan_gains(cfg.pan)
-                mono = fr.audio * cfg.volume
-                mix = mixes.get(cfg.audio_device)
-                if mix is None:
-                    mix = np.zeros((len(mono), 2), dtype=np.float32)
-                    mixes[cfg.audio_device] = mix
-                mix[:, 0] += mono * left
-                mix[:, 1] += mono * right
             if self.audio and self.audio.enabled:
-                devices = {c.audio_device for c in cfgs.values()}
-                n = chz.hop_c
+                any_solo = any(c.solo for c in cfgs)
+                gl = np.zeros(C, dtype=np.float32)
+                gr = np.zeros(C, dtype=np.float32)
+                for i, c in enumerate(cfgs):
+                    if f.open[i] and not c.mute and (c.solo or not any_solo) and c.volume > 0:
+                        left, right = pan_gains(c.pan)
+                        gl[i], gr[i] = c.volume * left, c.volume * right
                 for key in devices:
-                    mix = mixes.get(key)
-                    if mix is None:
-                        mix = np.zeros((n, 2), dtype=np.float32)
+                    idx = dev_rows[key]
+                    a = f.audio[idx]
+                    mix = np.empty((a.shape[1], 2), dtype=np.float32)
+                    mix[:, 0] = gl[idx] @ a
+                    mix[:, 1] = gr[idx] @ a
                     np.clip(mix, -1.0, 1.0, out=mix)
                     self.audio.write(key, mix)
 
-        if latest:
+        if last is not None:
             with self._lock:
-                for cid, fr in latest.items():
-                    st = self._status.get(cid)
+                for i, cfg in enumerate(cfgs):
+                    st = self._status.get(cfg.id)
                     if st is None:
                         continue
-                    st.rssi_db, st.noise_db = fr.rssi_db, fr.noise_db
-                    st.open, st.carrier, st.tone = fr.open, fr.carrier, fr.tone
-                    st.state = "active" if fr.open else "idle"
+                    st.rssi_db, st.noise_db = float(last.rssi[i]), float(last.noise[i])
+                    st.open, st.carrier, st.tone = last.open[i], last.carrier[i], last.tones[i]
+                    st.state = "active" if last.open[i] else "idle"
 
-    def _close_event(self, cid: str, open_events: dict, now: float) -> None:
-        ev = open_events.pop(cid, None)
+    def _close_event(self, cid: str, now: float) -> None:
+        ev = self._open_events.pop(cid, None)
         if ev is None:
             return
-        cfg = self.config.channel(cid)
         path = ""
         if ev.recorder is not None:
             ev.recorder.close()
             path = str(ev.recorder.path)
-        event = ActivityEvent(cid, cfg.name if cfg else cid, cfg.frequency if cfg else 0.0,
-                              ev.start, now, ev.peak, ev.tone, path)
+        event = ActivityEvent(cid, ev.name, ev.frequency, ev.start, now, ev.peak, ev.tone, path, ev.mode)
         with self._lock:
             self._events.append(event)
         with self._history_lock:
@@ -457,10 +490,9 @@ class Engine:
                     break
 
     def _close_all_events(self) -> None:
-        events = getattr(self, "_open_events", {})
         now = time.time()
-        for cid in list(events):
-            self._close_event(cid, events, now)
+        for cid in list(self._open_events):
+            self._close_event(cid, now)
         with self._lock:
             for st in self._status.values():
                 st.open = False

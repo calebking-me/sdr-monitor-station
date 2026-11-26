@@ -1,9 +1,10 @@
-"""Generate a synthetic multi-channel NFM IQ recording (SigMF cu8) for testing.
+"""Generate a synthetic multi-channel FM/AM IQ recording (SigMF cu8) for testing.
 
     python -m sdrscanner.tools.gen_iq demo --seconds 60
 
-Creates demo.sigmf-data / demo.sigmf-meta with several FM channels that key up
-in bursts with voice-like audio; some carry CTCSS tones. A matching profile
+Creates demo.sigmf-data / demo.sigmf-meta with several FM channels and one AM
+channel that key up in bursts with voice-like audio; some FM channels carry CTCSS
+tones. A matching profile
 (demo_profile.json) is written so the GUI can be tried without hardware.
 """
 
@@ -16,7 +17,7 @@ from pathlib import Path
 import numpy as np
 from scipy import signal
 
-from ..config import AppConfig, ChannelConfig, RadioConfig, SOURCE_FILE, save_profile
+from ..config import MODE_AM, MODE_FM, AppConfig, ChannelConfig, RadioConfig, SOURCE_FILE, save_profile
 from ..dsp import complex_to_u8
 from ..sources import write_sigmf_meta, sigmf_base
 
@@ -33,6 +34,8 @@ class SynthChannel:
     ctcss: float | None = None
     bursts: list[tuple[float, float]] = field(default_factory=list)   # (start, end) seconds
     pitch: float = 140.0
+    mode: str = MODE_FM
+    am_depth: float = 0.8          # AM modulation index at full voice level
 
 
 def default_channels(seconds: float, rng: np.random.Generator) -> list[SynthChannel]:
@@ -43,6 +46,7 @@ def default_channels(seconds: float, rng: np.random.Generator) -> list[SynthChan
         SynthChannel("Simplex", 212_500, -40, pitch=200),
         SynthChannel("Repeater out", 437_500, -55, ctcss=88.5, pitch=135),
         SynthChannel("Wideband 25k", 662_500, -42, deviation=5_000, pitch=150),
+        SynthChannel("AM test", 300_000, -45, pitch=125, mode=MODE_AM),
     ]
     for i, c in enumerate(chans):
         t = 1.0 + i * 1.3
@@ -101,16 +105,21 @@ def generate(path: str, seconds: float = 60.0, center: float = 460_000_000.0,
                 if not on_a.any():
                     continue
                 audio = 0.8 * voice_like(ta, c.pitch, rng)
-                if c.ctcss:
+                if c.ctcss and c.mode == MODE_FM:
                     audio = 0.85 * audio + 0.15 * np.sin(2 * np.pi * c.ctcss * ta)
                 audio *= on_a
                 a = np.interp(t, ta, audio)
                 on = np.interp(t, ta, on_a.astype(float)) > 0.5
-                inst = 2 * np.pi * (c.offset + c.deviation * a) / fs
-                ph = phases[c.name] + np.cumsum(inst)
-                phases[c.name] = float(ph[-1] % (2 * np.pi))
                 amp = 10 ** (c.level_db / 20)
-                x += on * amp * np.exp(1j * (ph + carrier_ph[c.name]))
+                if c.mode == MODE_AM:
+                    ph = phases[c.name] + 2 * np.pi * c.offset / fs * np.arange(1, n + 1)
+                    env = amp * (1.0 + c.am_depth * a)
+                else:
+                    inst = 2 * np.pi * (c.offset + c.deviation * a) / fs
+                    ph = phases[c.name] + np.cumsum(inst)
+                    env = amp
+                phases[c.name] = float(ph[-1] % (2 * np.pi))
+                x += on * env * np.exp(1j * (ph + carrier_ph[c.name]))
             f.write(complex_to_u8(x.astype(np.complex64)).tobytes())
     return out, chans
 
@@ -118,11 +127,16 @@ def generate(path: str, seconds: float = 60.0, center: float = 460_000_000.0,
 def make_profile(data_path: Path, chans: list[SynthChannel], center: float, fs: float) -> AppConfig:
     cfg = AppConfig(radio=RadioConfig(source=SOURCE_FILE, file_path=str(data_path.resolve()),
                                       file_center=center, file_rate=fs, file_loop=True))
+    pans = [-0.8, 0.8, 0.0, -0.4, 0.4, 0.0, 0.6]
     for i, c in enumerate(chans):
+        if c.mode == MODE_AM:
+            bw = 8_000.0
+        else:
+            bw = 12_500.0 if c.deviation <= 2_500 else 25_000.0
         cfg.channels.append(ChannelConfig(
-            name=c.name, frequency=center + c.offset,
-            bandwidth=12_500.0 if c.deviation <= 2_500 else 25_000.0,
-            squelch_db=-60.0, ctcss_hz=c.ctcss, pan=[-0.8, 0.8, 0.0, -0.4, 0.4, 0.0][i % 6]))
+            name=c.name, frequency=center + c.offset, mode=c.mode, bandwidth=bw,
+            squelch_db=-60.0, ctcss_hz=c.ctcss if c.mode == MODE_FM else None,
+            pan=pans[i % len(pans)]))
     cfg.ensure_colors()
     return cfg
 

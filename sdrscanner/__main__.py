@@ -11,10 +11,12 @@ from . import __version__
 
 
 def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(prog="sdrscanner", description="Multi-channel FM voice scanner for RTL-SDR")
+    parser = argparse.ArgumentParser(prog="sdrscanner",
+                                     description="Multi-channel FM/AM voice scanner for RTL-SDR")
     parser.add_argument("profile", nargs="?", help="channel profile (.json) to load")
     parser.add_argument("--iq", metavar="FILE", help="play back an IQ recording instead of using the dongle")
     parser.add_argument("--start", action="store_true", help="start receiving immediately")
+    parser.add_argument("--import-csv", metavar="CSV", help="open the channel import dialog for this CSV file")
     parser.add_argument("--self-test", nargs="?", const="", metavar="REPORT",
                         help="check the installation (DSP, audio, librtlsdr, GUI) and exit; "
                              "optionally write the report to REPORT")
@@ -35,7 +37,6 @@ def main(argv=None) -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName("SDR Scanner")
     app.setStyle("Fusion")
-    _dark_palette(app)
     from PySide6.QtGui import QIcon
     app.setWindowIcon(QIcon(str(Path(__file__).parent / "gui" / "icon.png")))
 
@@ -50,32 +51,15 @@ def main(argv=None) -> int:
     if args.iq:
         cfg.radio.source = SOURCE_FILE
         cfg.radio.file_path = str(Path(args.iq).resolve())
+        cfg.radio.file_center = cfg.radio.file_rate = 0.0     # take them from the new file
 
-    win = MainWindow(cfg, profile_path)
-    win.show()
+    win = MainWindow(cfg, profile_path)        # applies the saved theme / view settings
+    win.present()                               # normal, borderless or full screen
+    if args.import_csv:
+        win.import_channels(args.import_csv)
     if args.start:
         win.toggle_running()
     return app.exec()
-
-
-def _dark_palette(app) -> None:
-    from PySide6.QtGui import QColor, QPalette
-    p = QPalette()
-    base, alt, text = QColor("#1e1e1e"), QColor("#2a2a2a"), QColor("#e0e0e0")
-    p.setColor(QPalette.Window, alt)
-    p.setColor(QPalette.WindowText, text)
-    p.setColor(QPalette.Base, base)
-    p.setColor(QPalette.AlternateBase, alt)
-    p.setColor(QPalette.Text, text)
-    p.setColor(QPalette.Button, QColor("#333333"))
-    p.setColor(QPalette.ButtonText, text)
-    p.setColor(QPalette.Highlight, QColor("#2f6fb3"))
-    p.setColor(QPalette.HighlightedText, QColor("#ffffff"))
-    p.setColor(QPalette.ToolTipBase, alt)
-    p.setColor(QPalette.ToolTipText, text)
-    p.setColor(QPalette.Disabled, QPalette.Text, QColor("#777777"))
-    p.setColor(QPalette.Disabled, QPalette.ButtonText, QColor("#777777"))
-    app.setPalette(p)
 
 
 if __name__ == "__main__":
