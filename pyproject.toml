@@ -27,5 +27,8 @@ sdrscanner = "sdrscanner.__main__:main"
 [tool.setuptools.packages.find]
 include = ["sdrscanner*"]
 
+[tool.setuptools.package-data]
+"sdrscanner.gui" = ["icon.png"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

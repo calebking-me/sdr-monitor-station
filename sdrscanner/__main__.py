@@ -7,15 +7,26 @@ import os
 import sys
 from pathlib import Path
 
+from . import __version__
+
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="sdrscanner", description="Multi-channel FM voice scanner for RTL-SDR")
     parser.add_argument("profile", nargs="?", help="channel profile (.json) to load")
     parser.add_argument("--iq", metavar="FILE", help="play back an IQ recording instead of using the dongle")
     parser.add_argument("--start", action="store_true", help="start receiving immediately")
+    parser.add_argument("--self-test", nargs="?", const="", metavar="REPORT",
+                        help="check the installation (DSP, audio, librtlsdr, GUI) and exit; "
+                             "optionally write the report to REPORT")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
 
+    from .native import prepare_native_libs
+    prepare_native_libs()
     os.environ.setdefault("PYQTGRAPH_QT_LIB", "PySide6")
+    if args.self_test is not None:
+        from .selftest import run
+        return run(args.self_test or None)
     from PySide6.QtWidgets import QApplication
 
     from .config import SOURCE_FILE, AppConfig, last_profile_path, load_profile
@@ -25,6 +36,8 @@ def main(argv=None) -> int:
     app.setApplicationName("SDR Scanner")
     app.setStyle("Fusion")
     _dark_palette(app)
+    from PySide6.QtGui import QIcon
+    app.setWindowIcon(QIcon(str(Path(__file__).parent / "gui" / "icon.png")))
 
     profile_path = Path(args.profile) if args.profile else None
     cfg = AppConfig()
