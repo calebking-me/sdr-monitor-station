@@ -134,6 +134,45 @@ class Squelch:
         return self.open
 
 
+def _frozen(a: np.ndarray) -> np.ndarray:
+    a.setflags(write=False)
+    return a
+
+
+# Filter designs depend only on the channel rate and are shared by every bank: scanning
+# rebuilds the bank at every retune, so designing them once keeps a retune cheap.
+@lru_cache(maxsize=32)
+def _channel_filter(ntaps: int, cutoff: float, rate: float, nc: int, n: int) -> np.ndarray:
+    taps = signal.firwin(ntaps, cutoff, fs=rate, window=("kaiser", 7.0))
+    return _frozen((sfft.fft(taps, nc) * (nc / n)).astype(np.complex64))
+
+
+@lru_cache(maxsize=8)
+def _iir_designs(rate: float) -> tuple[np.ndarray, np.ndarray]:
+    """(voice band-pass, sub-audio low-pass) second-order sections."""
+    voice = signal.butter(4, [300.0, 3000.0], btype="bandpass", fs=rate, output="sos")
+    sub = signal.butter(4, 270.0, fs=rate, output="sos")
+    return voice, sub           # not frozen: scipy's sosfilt wants writable coefficients (never modified)
+
+
+@lru_cache(maxsize=16)
+def _deemphasis(tau_us: float, rate: float) -> tuple[np.ndarray, np.ndarray]:
+    alpha = 1.0 - math.exp(-1.0 / (rate * tau_us * 1e-6))
+    b, a = np.array([alpha]), np.array([1.0, alpha - 1.0])
+    _, h = signal.freqz(b, a, worN=[1000.0], fs=rate)   # 0 dB at 1 kHz
+    return b / abs(h[0]), a
+
+
+@lru_cache(maxsize=8)
+def _ctcss_basis(ct_n: int, ct_rate: float) -> tuple[np.ndarray, np.ndarray, float, float]:
+    """(window, tone basis (n, tones), amplitude norm, power norm) for the CTCSS detector."""
+    win = np.hanning(ct_n)
+    t = np.arange(ct_n) / ct_rate
+    basis = (np.exp(-2j * np.pi * np.outer(CTCSS_TONES, t)) * win).T
+    return _frozen(win), _frozen(np.ascontiguousarray(basis)), float((win.sum() / 2) ** 2), \
+        float((win ** 2).sum() / 2)
+
+
 @dataclass
 class _Row:
     """Per-channel scalar state; survives bank rebuilds while the channel's key is unchanged."""
@@ -206,14 +245,9 @@ class ChannelBank:
         self.ramp01 = np.linspace(0.0, 1.0, hop, dtype=np.float32)
 
         ntaps = min(nc - hop - 1, 255) | 1
-        cache: dict[float, np.ndarray] = {}
         H = np.empty((C, nc), dtype=np.complex64)
         for i, c in enumerate(cfgs):
-            cut = channel_cutoff(c.bandwidth, c.mode)
-            if cut not in cache:
-                taps = signal.firwin(ntaps, cut, fs=rate, window=("kaiser", 7.0))
-                cache[cut] = (sfft.fft(taps, nc) * (nc / n)).astype(np.complex64)
-            H[i] = cache[cut]
+            H[i] = _channel_filter(ntaps, channel_cutoff(c.bandwidth, c.mode), rate, nc, n)
         self.H = H
         self.scale = np.array([rate / (2 * np.pi * nominal_deviation(c.bandwidth)) for c in cfgs],
                               dtype=np.float32)
@@ -225,18 +259,15 @@ class ChannelBank:
                 groups.setdefault(float(c.deemphasis_us), []).append(i)
         self.deemph = []
         for tau, rows in groups.items():
-            alpha = 1.0 - math.exp(-1.0 / (rate * tau * 1e-6))
-            b, a = np.array([alpha]), np.array([1.0, alpha - 1.0])
-            _, h = signal.freqz(b, a, worN=[1000.0], fs=rate)   # 0 dB at 1 kHz
-            self.deemph.append((b / abs(h[0]), a, np.array(rows, dtype=np.int64)))
+            b, a = _deemphasis(tau, rate)
+            self.deemph.append((b, a, np.array(rows, dtype=np.int64)))
         self.de_zi = np.zeros((C, 1))
 
-        self.voice_sos = signal.butter(4, [300.0, 3000.0], btype="bandpass", fs=rate, output="sos")
+        self.voice_sos, self.ct_sos = _iir_designs(rate)
         self.voice_zi = np.zeros((self.voice_sos.shape[0], C, 2))
 
         self.ct_dec = max(1, int(round(rate / 3000.0)))
         ct_rate = rate / self.ct_dec
-        self.ct_sos = signal.butter(4, 270.0, fs=rate, output="sos")
         self.ct_zi = np.zeros((self.ct_sos.shape[0], C, 2))
         self.ct_n = int(self.CT_WINDOW_S * ct_rate)
         self.dcs_n = int(self.DCS_WINDOW_S * ct_rate)
@@ -251,11 +282,7 @@ class ChannelBank:
                                     for ph in range(self.DCS_PHASES)], dtype=np.int64)
         self.dcs_weights = (1 << np.arange(dcs.WORD_BITS)).astype(np.int64)
         self.dcs_patterns, self.dcs_pattern_class = dcs.lookup_arrays()
-        self.ct_win = np.hanning(self.ct_n)
-        t = np.arange(self.ct_n) / ct_rate
-        self.ct_basis = (np.exp(-2j * np.pi * np.outer(CTCSS_TONES, t)) * self.ct_win).T  # (n, tones)
-        self.ct_norm_amp = (self.ct_win.sum() / 2) ** 2
-        self.ct_norm_pow = (self.ct_win ** 2).sum() / 2
+        self.ct_win, self.ct_basis, self.ct_norm_amp, self.ct_norm_pow = _ctcss_basis(self.ct_n, ct_rate)
         self.ct_phase = previous.ct_phase if prev_map else 0
         self.ct_counter = previous.ct_counter if prev_map else 0
 

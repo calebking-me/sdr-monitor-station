@@ -3,11 +3,15 @@
 Monitor many FM and AM voice channels **at the same time** with a single RTL-SDR
 dongle. Every channel inside the dongle's capture bandwidth (about 2 MHz at
 2.4 MS/s) is demodulated in parallel. Each channel has its own squelch, CTCSS or
-DCS tone squelch, volume, left/right fade and audio output device.
+DCS tone squelch, volume, left/right fade and audio output device. Channels that
+are too far apart to receive at once are covered by **scanning**: the dongle
+steps between sets of channels and stops wherever something is heard.
 
 ![Screenshot: the demo recording with channel lists, a priority channel and last-heard times](docs/screenshot.png)
 
 ![Screenshot: all 40 CB channels (AM) in the compact view](docs/screenshot-cb.png)
+
+![Screenshot: scanning four sets of channels (2 m, NOAA, FRS 1–7 and FRS 8–14), stopped on an active channel](docs/screenshot-scan.png)
 
 - **FM and AM.** Narrow (12.5 kHz) and wide (25 kHz) FM for land-mobile,
   amateur, marine, FRS/GMRS and MURS. AM for aviation and CB, with
@@ -24,6 +28,11 @@ DCS tone squelch, volume, left/right fade and audio output device.
 - **CTCSS and DCS.** Tone squelch on all 50 CTCSS tones and all 104 DCS codes,
   in normal or inverted polarity. The tone or code each FM channel is using is
   shown live, logged, and can be adopted as its squelch with one click.
+- **Scanning across bands.** Monitor 146 MHz, 162 MHz and 462 MHz from one
+  dongle. Channels are split into sets that each fit one tuning. The dongle steps
+  between the sets and stays on a set while something is heard there, with an
+  adjustable **scan speed** (time per set) and **dwell time** (how long to wait
+  for a reply), plus Hold, Next and Previous.
 - **Channel lists.** Group channels ("Local", "Marine", "CB"…) and switch between
   them from the toolbar or with Ctrl+1…9. Only the chosen list is received, and
   the dongle retunes for it.
@@ -160,7 +169,9 @@ You can also play any recording with `python -m sdrscanner --iq capture.sigmf-me
    - **Channels → Add from preset…** (Ctrl+P). See [Preset lists](#preset-lists).
    - **Channels → Import CSV…** (Ctrl+I). See
      [Importing channels from CSV](#importing-channels-from-csv).
-3. Press **Start** (F5).
+3. Press **Start** (F5). If your channels are spread over more than one
+   tuning (about 2 MHz), press **⟳ Scan** (F6) as well. See
+   [Scanning](#scanning-between-sets-of-channels).
 
 The status bar shows the chosen centre frequency, the usable span, and any
 warning. You get a warning when channels don't fit in the capture bandwidth or
@@ -220,9 +231,9 @@ Ctrl+` for all channels.
 
 | Preset | Channels | Mode | Fits in one capture? |
 |---|---|---|---|
-| FRS (US/CA) | 22 | NFM 12.5 kHz | 1–7 + 15–22 together; 8–14 are 5 MHz higher |
+| FRS (US/CA) | 22 | NFM 12.5 kHz | 1–7 + 15–22 together; 8–14 are 5 MHz higher (Scan covers both) |
 | GMRS (US) | 22 | FM 25 kHz (8–14 narrow) | same split as FRS |
-| MURS (US) | 5 | NFM / FM | spans 2.8 MHz: pick 151 MHz or 154 MHz |
+| MURS (US) | 5 | NFM / FM | spans 2.8 MHz: pick 151 MHz or 154 MHz, or turn on Scan |
 | CB (40 ch) | 40 | AM 8 kHz | yes (27 MHz; R820T/R828D tuners reach it) |
 | NOAA Weather Radio | 7 | FM 25 kHz | yes |
 | Marine VHF (US common) | 12 | FM 25 kHz | yes |
@@ -232,7 +243,8 @@ Ctrl+` for all channels.
 
 The picker plans the centre frequency for your current channels plus the
 selected ones, and marks each row *fits*, *outside capture band*, or *already in
-your list*. **Select only those that fit** keeps the largest group that can be
+your list*. With scanning on, it shows the scan set each selected channel
+joins instead. **Select only those that fit** keeps the largest group that can be
 received at once. Set the squelch for the new channels in the picker, then
 fine-tune each one with its **Auto** button.
 
@@ -284,8 +296,8 @@ spreadsheet.
 |---|---|
 | Theme | Dark or light |
 | Layout | Spectrum above the channels, or side by side (good for wide screens) |
-| Show spectrum / waterfall / channel panel / toolbar / status bar | Hide what you don't need (one panel always stays visible) |
-| Streamlined view (Ctrl+M) | Hides the menu bar, toolbar and panel tabs for a clean second-monitor display |
+| Show spectrum / waterfall / channel panel / toolbars / status bar | Hide what you don't need (one panel always stays visible) |
+| Streamlined view (Ctrl+M) | Hides the menu bar, toolbars and panel tabs for a clean second-monitor display |
 | Compact channel strips | One line per channel, for long lists such as the 40 CB channels |
 | Channel labels | Names on the spectrum for all channels, active channels only, or none |
 | Waterfall colours | Inferno, magma, plasma, viridis, cividis, turbo, grayscale |
@@ -324,9 +336,56 @@ The dongle also has a spike of LO leakage exactly at the tuned frequency. With
    stays close to the middle of the channel group.
 
 If the channels span more than the usable bandwidth, it covers the largest
-group that fits, marks the rest as *out of band*, and shows a warning. When you
-add, move or enable channels while running, the dongle is retuned
+group that fits, marks the rest as *out of band*, and shows a warning. Turn on
+[scanning](#scanning-between-sets-of-channels) (F6) to cover all of them. When
+you add, move or enable channels while running, the dongle is retuned
 automatically. For IQ file playback, the centre is fixed by the recording.
+
+### Scanning between sets of channels
+
+One tuning covers about 2 MHz. To monitor channels further apart, for example
+a 2 m repeater, NOAA weather and FRS, press **⟳ Scan** (F6) in the Scanner
+toolbar.
+
+- The channels being monitored (the active list, or all) are split into
+  **sets**. Each set is a group of channels that fit in one tuning together.
+  Channels close to each other share a set and are still received at the same
+  time. The status bar shows the sets; hover over it to see which channels are
+  in each one.
+- The dongle tunes to one set at a time. While nothing is heard, it moves on
+  after the **Speed** time (*seconds per set*). When a channel in the set opens,
+  the scanner stays. After the transmission ends, it waits the **Dwell** time
+  for a reply before moving on. Both can be changed while it runs.
+- The toolbar shows where it is, e.g. `Set 2/3 · 462.556–462.719 MHz · active`.
+  Channels in other sets show `scanning · set N` on their strip.
+- **⏸ Hold** (F7) stays on the current set. **⏭ Next set** (F8) and
+  **⏮ Previous set** (Shift+F8) move by hand, also while holding.
+- Channels with CTCSS/DCS tone squelch need about 1 s to decode their tone.
+  When such a channel has a carrier, the scanner automatically stays long enough
+  to find out whether the tone matches, even with a short time per set.
+- **Radio settings → Scanning** has the same settings and two more:
+  - *Leave a busy set after*: move on from a set that has been busy this long,
+    so a channel that never stops (a weather broadcast, a stuck transmitter)
+    can't stop the scan. The default is *never*.
+  - *Retune settle time*: samples discarded after each retune. *Automatic* is
+    50 ms for USB and 150 ms for rtl_tcp.
+- Each set keeps its own waterfall, average and zoom. When the scanner comes
+  back to a set, its history is still there.
+- Recordings, the log, alerts and priority work as usual for the set being
+  received. A transmission still open when the scanner moves on ends at that
+  point.
+
+Things to know:
+
+- A transmission on another set is only heard once the scanner gets there. A
+  full cycle while quiet takes *sets × time per set* (shown in the status bar).
+  Fewer, wider sets (a higher sample rate) and a shorter time per set mean
+  fewer missed starts.
+- Scanning always picks the centre of each set automatically. The manual centre
+  setting is only used without scanning.
+- A set the dongle can't tune to (outside the tuner's range) is skipped, with a
+  message.
+- IQ recordings stop at the next retune, and IQ file playback can't be scanned.
 
 ### Squelch
 
@@ -389,7 +448,8 @@ use it on a network you trust.
 F5 start/stop · Ctrl+N add channel · Ctrl+P presets · Ctrl+I import CSV ·
 Ctrl+O/Ctrl+S open/save profile · Ctrl+L channel lists · Ctrl+1…9 / Ctrl+` monitor a
 list / all · Ctrl+A select all · Ctrl+E edit selected · Alt+Up/Down move · Del delete
-selected · Ctrl+M streamlined view · Ctrl+B borderless · F11 full screen (Esc leaves) ·
+selected · F6 scan on/off · F7 hold · F8 / Shift+F8 next / previous scan set ·
+Ctrl+M streamlined view · Ctrl+B borderless · F11 full screen (Esc leaves) ·
 Alt+drag move a borderless window · Ctrl+= zoom to channels · Ctrl+0 full band.
 They're also listed under *Help → Keyboard shortcuts*.
 
@@ -444,6 +504,19 @@ They're also listed under *Help → Keyboard shortcuts*.
     least 23 agreeing windows in two consecutive checks. Noise matches about
     0.03% of windows, so false codes are effectively impossible.
   - Polarity convention: *normal* means a 1 bit raises the carrier frequency.
+- **Scanning** (`sdrscanner/planner.py`, `sdrscanner/scan.py`):
+  - `plan_scan` sorts the channels by frequency and fills each set with every
+    remaining channel that fits in the usable span above the lowest one. If the
+    DC spike would land on a channel, the set gives up its highest channels.
+  - After every block of samples, the DSP thread runs the scan state machine
+    (listen → active → dwell). It counts *received* samples, not wall-clock
+    time, so a busy computer doesn't shorten a visit.
+  - To move on, it ends the set's open transmissions and sends the reader thread
+    a numbered retune request. The reader retunes, throws away the settle
+    time's worth of samples, and tags every later chunk with the request
+    number. Chunks taken before the retune are dropped.
+  - The channel bank is then rebuilt for the new set. Filter designs are
+    cached, so a rebuild takes about a millisecond.
 - **Threads**: the USB/network/file reader, the DSP, and each PortAudio
   callback run off the GUI thread. The GUI polls a snapshot 25 times a second
   and never blocks. If the DSP falls behind, the oldest chunks are dropped and
@@ -548,15 +621,15 @@ does the same on every push and pull request. It runs the test suite on
 Windows, builds the exe, runs its self-test, and uploads the zip as an
 artifact.
 
-To publish a GitHub release with the zip, either push a tag such as `v0.2.0`,
+To publish a GitHub release with the zip, either push a tag such as `v0.3.0`,
 or run the workflow manually on `main` (*Actions → Windows build → Run
 workflow*) with *release_tag* set. A manual run creates the tag for you. In both
 cases the tag must match the app version. When you bump the version, update
 `sdrscanner/__init__.py`, `pyproject.toml` and `packaging/version_info.txt`
 (a test checks they agree).
 
-`--self-test` checks the FM and AM DSP chain, PortAudio, librtlsdr loading, and
-the GUI with an IQ playback run. No dongle or sound card is needed. It exits
+`--self-test` checks the FM and AM DSP chain, PortAudio, librtlsdr loading,
+scanning (with a simulated radio), and the GUI with an IQ playback run. No dongle or sound card is needed. It exits
 non-zero on failure, and because the exe has no console window, it writes its
 report to the file you name.
 

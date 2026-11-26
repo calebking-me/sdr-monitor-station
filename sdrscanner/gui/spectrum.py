@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
@@ -16,6 +18,7 @@ WATERFALL_ROWS = 300
 MIN_SPAN_MHZ = 0.005
 FREQ_STEP_HZ = 6_250.0
 LEVEL_HYSTERESIS_DB = 1.5      # re-range the spectrum only when auto levels move this much
+BAND_MEMORY_BYTES = 48 * 1024 * 1024   # waterfalls kept for other tunings (scan sets)
 
 
 class ChannelBands(pg.GraphicsObject):
@@ -89,6 +92,9 @@ class SpectrumView(QWidget):
         self._peak = None
         self._levels = None
         self._pending: list[np.ndarray] = []
+        # While scanning, each tuning (scan set) keeps its own waterfall, average and zoom.
+        self._band_mem: OrderedDict[tuple[float, float], dict] = OrderedDict()
+        self._band_set = False
         self._markers: dict[str, dict] = {}      # cid -> {lo, hi, color, active, label}
         self._applied_range = None
         self._label_mode = view.channel_labels
@@ -215,20 +221,50 @@ class SpectrumView(QWidget):
 
     # ---------------------------------------------------------------- data
     def set_band(self, lo_hz: float, hi_hz: float, center_hz: float) -> None:
+        """Show the band of the current tuning. A band shown before gets its waterfall back."""
         lo, hi = lo_hz / 1e6, hi_hz / 1e6
         self._center = center_hz / 1e6
         self.center_line.setValue(self._center)
         if (lo, hi) == (self._lo, self._hi):
             return
+        if self._band_set:
+            self._remember_band()
+        saved = self._band_mem.pop((lo, hi), None)
         self._lo, self._hi = lo, hi
-        self._wf.fill(-120.0)
-        self._avg = self._peak = None
+        self._band_set = True
+        view = (lo, hi)
         self._pending = []
+        if saved is not None and saved["wf"].shape == self._wf.shape:
+            self._wf = saved["wf"].astype(np.float32)
+            self._avg, self._peak = saved["avg"], saved["peak"]
+            view = saved["view"]
+        else:
+            self._wf = np.full(self._wf.shape, -120.0, dtype=np.float32)
+            self._avg = self._peak = None
         for plot in (self.spec_plot, self.wf_plot):
             plot.getViewBox().setLimits(xMin=lo, xMax=hi, minXRange=MIN_SPAN_MHZ)
-        self.spec_plot.setXRange(lo, hi, padding=0)
+        self.spec_plot.setXRange(*view, padding=0)
         self.wf_img.setImage(self._wf, autoLevels=False, levels=self._current_levels())
         self.wf_img.setRect(QRectF(lo, 0, hi - lo, WATERFALL_ROWS))
+        x = np.linspace(lo, hi, len(self._avg), endpoint=False) if self._avg is not None else []
+        self.spec_curve.setData(x, self._avg if self._avg is not None else [])
+        if self._peak_on:
+            self.peak_curve.setData(x if self._peak is not None else [], self._peak if self._peak is not None else [])
+
+    def _remember_band(self) -> None:
+        key = (self._lo, self._hi)
+        lo, hi = self.spec_plot.getViewBox().viewRange()[0]
+        self._band_mem[key] = {"wf": self._wf.astype(np.float16), "avg": self._avg, "peak": self._peak,
+                               "view": (max(lo, self._lo), min(hi, self._hi))}
+        self._band_mem.move_to_end(key)
+        total = sum(m["wf"].nbytes for m in self._band_mem.values())
+        while total > BAND_MEMORY_BYTES and len(self._band_mem) > 1:
+            _, old = self._band_mem.popitem(last=False)
+            total -= old["wf"].nbytes
+
+    def forget_bands(self) -> None:
+        """Drop the waterfalls kept for other tunings."""
+        self._band_mem.clear()
 
     def _current_levels(self) -> tuple[float, float]:
         if not self._auto_levels or self._levels is None:

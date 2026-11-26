@@ -257,11 +257,14 @@ class ChannelStrip(QFrame):
 
     def update_status(self, st: ChannelStatus | None) -> None:
         self.last_status = st
-        if st is None or st.state in ("disabled", "out_of_band", "stopped", "not_in_list"):
+        if st is None or st.state in ("disabled", "out_of_band", "stopped", "not_in_list", "scanning"):
             self.led.set_state(False)
             self.meter.set_values(-120, -120, self.cfg.squelch_db, False, dimmed=True)
-            self.tone.setText({"out_of_band": "out of band", "disabled": "disabled"}.get(
-                st.state if st else "", ""))
+            text = {"out_of_band": "out of band", "disabled": "disabled"}.get(st.state if st else "", "")
+            if st is not None and st.state == "scanning":
+                # Waiting for the scanner to reach this channel's set.
+                text = f"scanning · set {st.scan_set}" if st.scan_set else "scanning"
+            self.tone.setText(text)
             return
         self._noise = st.noise_db
         self.led.set_state(st.open, clean_color(self.cfg.color) or "#66ff66")

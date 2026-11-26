@@ -33,6 +33,7 @@ class EndOfStream(Exception):
 class IQSource:
     tunable = True
     name = "source"
+    retune_settle = 0.05      # seconds of samples to discard after a retune
 
     def __init__(self):
         self.sample_rate = 0.0
@@ -148,6 +149,7 @@ class RtlTcpSource(IQSource):
     """Minimal client for the rtl_tcp protocol (unsigned 8-bit IQ stream)."""
 
     name = "rtl_tcp"
+    retune_settle = 0.15      # the server and the network buffer more data than USB does
     CMD_FREQ, CMD_RATE, CMD_GAIN_MODE, CMD_GAIN, CMD_PPM, CMD_AGC = 1, 2, 3, 4, 5, 8
 
     def __init__(self, cfg: RadioConfig):

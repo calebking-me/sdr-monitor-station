@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import MAX_CHANNELS, MAX_GROUP_NAME, SOURCE_FILE, AppConfig, ChannelConfig, clean_text
-from ..planner import plan_center, usable_half_span
+from ..planner import plan_center, plan_scan, usable_half_span
 from ..presets import PRESETS
 from . import theme
 from .channels import bandwidth_label
@@ -194,9 +194,20 @@ class ChannelPickerDialog(QDialog):
             return plan_center(chans, r.file_rate, fixed_center=r.file_center)
         return plan_center(chans, r.sample_rate, r.auto_center, r.manual_center)
 
+    def _scan_plan(self, rows: list[int]):
+        """The scan sets the channels would form, when scanning is on and needed."""
+        r = self.config.radio
+        if not self.config.scan.enabled or r.source == SOURCE_FILE:
+            return None
+        base = [] if self.replace.isChecked() else self.config.monitored_channels()
+        sp = plan_scan(base + [self.candidates[i] for i in rows], r.sample_rate)
+        return sp if len(sp.sets) > 1 else None
+
     def _refresh_status(self) -> None:
         rows = self._checked_rows()
+        checked = set(rows)
         plan = self._plan(rows)
+        sp = self._scan_plan(rows)
         t = theme.tokens()
         self._updating = True
         half = usable_half_span(plan.sample_rate) if plan else 0
@@ -204,7 +215,10 @@ class ChannelPickerDialog(QDialog):
         for r, c in enumerate(self.candidates):
             item = self.table.item(r, 6)
             dup = self.table.item(r, 0).data(Qt.UserRole)
-            if plan is None:
+            idx = sp.set_index_of(c.id) if sp is not None and r in checked else None
+            if idx is not None:
+                text, color = f"scan set {idx + 1} of {len(sp.sets)}", t["good"]
+            elif plan is None or (sp is not None and r not in checked):
                 text, color = "", t["text"]
             elif self._fits(c, plan.center, half):
                 text, color = "fits", t["good"]
@@ -220,7 +234,10 @@ class ChannelPickerDialog(QDialog):
         existing = 0 if self.replace.isChecked() else len(self.config.channels)
         total = existing + len(rows)
         msg = f"{len(rows)} selected"
-        if plan is not None:
+        if sp is not None:
+            msg += (f" · scanning {len(sp.sets)} sets "
+                    f"(full cycle ≈ {sp.cycle_seconds(self.config.scan.listen_time):.1f} s when quiet)")
+        elif plan is not None:
             msg += (f" · centre would be {plan.center / 1e6:.4f} MHz "
                     f"(usable {plan.usable_lo / 1e6:.3f}-{plan.usable_hi / 1e6:.3f} MHz)")
         if out:

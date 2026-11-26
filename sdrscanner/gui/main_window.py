@@ -10,7 +10,8 @@ from pathlib import Path
 from PySide6.QtCore import QByteArray, QEvent, QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QKeySequence, QPainter, QPen, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog,
+    QAbstractItemView, QApplication, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QHeaderView,
+    QInputDialog,
     QLabel, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
     QSystemTrayIcon, QTableWidget, QTableWidgetItem, QTabWidget, QToolBar, QToolButton, QVBoxLayout, QWidget,
 )
@@ -19,11 +20,11 @@ from .. import __version__
 from ..activity import ActivityEvent, event_row, export_csv
 from ..channel_io import export_channels_csv, import_channels_csv
 from ..config import (
-    MAX_CHANNELS, MAX_GROUPS, MODE_FM, SOURCE_FILE, AppConfig, ChannelConfig, ChannelGroup, last_profile_path,
-    load_profile, save_profile, unique_group_name,
+    MAX_CHANNELS, MAX_GROUPS, MAX_SCAN_DWELL, MAX_SCAN_LISTEN, MIN_SCAN_LISTEN, MODE_FM, SOURCE_FILE, AppConfig,
+    ChannelConfig, ChannelGroup, last_profile_path, load_profile, save_profile, unique_group_name,
 )
 from ..engine import Engine
-from ..planner import plan_center
+from ..planner import plan_center, plan_scan
 from . import theme
 from .bulk import BulkEditDialog
 from .channels import ChannelDialog, ChannelList, ChannelStrip
@@ -39,6 +40,8 @@ from .widgets import plain_label
 LOG_COLUMNS = ["Start", "Channel", "Frequency (MHz)", "Mode", "Duration (s)", "Peak (dBFS)", "Tone",
                "Recording"]
 ALERT_REPEAT_S = 15.0           # at most one alert per channel in this time
+SCAN_STATE_TEXT = {"scanning": "scanning", "active": "active", "dwell": "dwell – waiting for a reply",
+                   "hold": "hold"}
 MANAGE_LISTS = "__manage__"
 MAX_LOG_ROWS = 5000
 RESIZE_MARGIN = 6
@@ -55,6 +58,8 @@ SHORTCUTS = (
     ("Drag a channel", "Reorder channels"), ("Del", "Delete the selected channels"),
     ("Ctrl+L", "Manage channel lists"), ("Ctrl+1 … Ctrl+9", "Monitor channel list 1 … 9"),
     ("Ctrl+`", "Monitor all channels"),
+    ("F6", "Scan on/off (step between sets of channels too far apart for one tuning)"),
+    ("F7", "Hold on the current scan set"), ("F8 / Shift+F8", "Next / previous scan set"),
     ("Ctrl+0", "Show the full captured band"), ("Ctrl+=", "Zoom to the enabled channels"),
     ("Mouse wheel / drag", "Zoom / pan the spectrum and waterfall"),
     ("Double-click spectrum", "Add a channel at that frequency"), ("Right-click spectrum", "More actions"),
@@ -91,6 +96,8 @@ class MainWindow(QMainWindow):
         self._alerted: dict[str, float] = {}
         self._tray = None
         self._app_filter = False
+        self._last_scan = None          # engine.ScanStatus from the last poll
+        self._scan_tip_key = None
         theme.apply(QApplication.instance(), self.view.theme)
         self.menuBar().setNativeMenuBar(False)       # keep it in-window (needed for borderless dragging)
         self.resize(1280, 900)
@@ -150,7 +157,16 @@ class MainWindow(QMainWindow):
                            tip="Named groups of channels you can switch between")
         self.act_streamlined = A("Streamlined view (hide bars)", lambda v: self._set_view("streamlined", v),
                                  "Ctrl+M", checkable=True,
-                                 tip="Hide the menu bar, toolbar and panel tabs - press Ctrl+M to bring them back")
+                                 tip="Hide the menu bar, toolbars and panel tabs - press Ctrl+M to bring them back")
+        self.act_scan = A("⟳ Scan", self.set_scan_enabled, "F6", checkable=True,
+                          tip="Scan: step the receiver between sets of channels that are too far apart to "
+                              "receive with one tuning (F6)")
+        self.act_hold = A("⏸ Hold", self.set_scan_hold, "F7", checkable=True,
+                          tip="Stay on the current scan set (F7)")
+        self.act_scan_prev = A("⏮ Previous set", lambda: self.scan_step(-1), "Shift+F8",
+                               tip="Go to the previous scan set now (Shift+F8)")
+        self.act_scan_next = A("⏭ Next set", lambda: self.scan_step(1), "F8",
+                               tip="Go to the next scan set now (F8)")
 
         tb = QToolBar("Main")
         tb.setObjectName("main_toolbar")
@@ -166,6 +182,37 @@ class MainWindow(QMainWindow):
         self.list_combo.setToolTip("Which channel list to receive (Ctrl+1…9, Ctrl+` for all)")
         self.list_combo.activated.connect(self._on_list_combo)
         tb.addWidget(self.list_combo)
+
+        stb = QToolBar("Scanner")
+        stb.setObjectName("scan_toolbar")
+        stb.setMovable(False)
+        self.addToolBarBreak()
+        self.addToolBar(stb)
+        self.scan_toolbar = stb
+        for a in (self.act_scan, self.act_hold, self.act_scan_prev, self.act_scan_next):
+            stb.addAction(a)
+        stb.addSeparator()
+        stb.addWidget(QLabel(" Speed "))
+        self.scan_speed = QDoubleSpinBox(decimals=2, minimum=MIN_SCAN_LISTEN, maximum=MAX_SCAN_LISTEN,
+                                         singleStep=0.05, suffix=" s per set")
+        self.scan_speed.setToolTip("Scan speed: how long each set is checked for activity before the receiver "
+                                   "moves on. Lower is faster; channels with CTCSS/DCS get the extra time "
+                                   "their tone needs automatically.")
+        self.scan_speed.valueChanged.connect(self._on_scan_speed)
+        stb.addWidget(self.scan_speed)
+        stb.addWidget(QLabel(" Dwell "))
+        self.scan_dwell = QDoubleSpinBox(decimals=1, minimum=0.0, maximum=MAX_SCAN_DWELL, singleStep=0.5,
+                                         suffix=" s")
+        self.scan_dwell.setToolTip("Dwell time: how long to stay on a set after a transmission ends, "
+                                   "to hear the reply, before scanning resumes")
+        self.scan_dwell.valueChanged.connect(self._on_scan_dwell)
+        stb.addWidget(self.scan_dwell)
+        for w in (self.scan_speed, self.scan_dwell):
+            w.setKeyboardTracking(False)          # typed values apply when editing ends, not per keystroke
+        stb.addSeparator()
+        self.scan_status = plain_label("")
+        self.scan_status.setStyleSheet("padding: 0 6px")
+        stb.addWidget(self.scan_status)
 
         mb = self.menuBar()
         m = mb.addMenu("&File")
@@ -202,6 +249,9 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&Radio")
         for a in (self.act_start, self.act_settings, self.act_iq):
             m.addAction(a)
+        m.addSeparator()
+        for a in (self.act_scan, self.act_hold, self.act_scan_prev, self.act_scan_next):
+            m.addAction(a)
 
         m = mb.addMenu("&View")
         sub = m.addMenu("Theme")
@@ -226,7 +276,7 @@ class MainWindow(QMainWindow):
         self.act_show_spec = A("Show spectrum", lambda v: self._set_view("show_spectrum", v), checkable=True)
         self.act_show_wf = A("Show waterfall", lambda v: self._set_view("show_waterfall", v), checkable=True)
         self.act_show_panel = A("Show channel panel", lambda v: self._set_view("show_panel", v), checkable=True)
-        self.act_show_tb = A("Show toolbar", lambda v: self._set_view("show_toolbar", v), checkable=True)
+        self.act_show_tb = A("Show toolbars", lambda v: self._set_view("show_toolbar", v), checkable=True)
         self.act_show_sb = A("Show status bar", lambda v: self._set_view("show_statusbar", v), checkable=True)
         self.act_compact = A("Compact channel strips", lambda v: self._set_view("compact_strips", v),
                              checkable=True)
@@ -413,6 +463,7 @@ class MainWindow(QMainWindow):
         # Streamlined view: no menu bar, toolbar or tab bar - just spectrum, waterfall and channels.
         self.menuBar().setVisible(not v.streamlined)
         self.toolbar.setVisible(v.show_toolbar and not v.streamlined)
+        self.scan_toolbar.setVisible(v.show_toolbar and not v.streamlined)
         self.tabs.tabBar().setVisible(not v.streamlined)
         self.statusBar().setVisible(v.show_statusbar)
         self._update_app_filter()
@@ -461,6 +512,10 @@ class MainWindow(QMainWindow):
 
     def zoom_to_channels(self) -> None:
         chans = self.config.monitored_channels()
+        sc = self._last_scan
+        if self.engine.scanning and sc is not None and sc.state != "single":
+            ids = set(sc.sets[sc.index].channel_ids)          # the set being received
+            chans = [c for c in chans if c.id in ids] or chans
         if not chans:
             self.spectrum.zoom_full()
             return
@@ -1035,13 +1090,28 @@ class MainWindow(QMainWindow):
 
     def _update_plan_preview(self) -> None:
         r = self.config.radio
+        self._sync_scan_controls()
         if self.engine.running:
             return
         if r.source == SOURCE_FILE:
-            self.status_plan.setText("IQ file playback: centre frequency comes from the recording")
+            self.status_plan.setText("IQ file playback: centre frequency comes from the recording"
+                                     + (" (a recording cannot be retuned, so it is not scanned)"
+                                        if self.config.scan.enabled else ""))
             self.status_plan.setToolTip("")
+            self.scan_status.setText("")
             return
-        plan = plan_center(self.config.monitored_channels(), r.sample_rate, r.auto_center, r.manual_center)
+        monitored = self.config.monitored_channels()
+        sc = self.config.scan
+        if sc.enabled:
+            sp = plan_scan(monitored, r.sample_rate)
+            if len(sp.sets) > 1:
+                self._show_scan_sets(sp.sets, None, sp.cycle_seconds(sc.listen_time))
+                self.scan_status.setText(f"{len(sp.sets)} sets – press Start to scan")
+                return
+            self.scan_status.setText("all channels fit in one tuning" if sp.sets else "")
+        else:
+            self.scan_status.setText("")
+        plan = plan_center(monitored, r.sample_rate, r.auto_center or sc.enabled, r.manual_center)
         self._show_plan(plan)
 
     def _show_plan(self, plan) -> None:
@@ -1050,11 +1120,84 @@ class MainWindow(QMainWindow):
         text = f"Centre {plan.center / 1e6:.4f} MHz, usable {plan.usable_lo / 1e6:.3f}–{plan.usable_hi / 1e6:.3f} MHz"
         if plan.warnings:
             text = "⚠ " + plan.warnings[0] + (f" (+{len(plan.warnings) - 1} more)" if len(plan.warnings) > 1 else "")
-            self.status_plan.setToolTip(tooltip_text("\n".join(plan.warnings)))
+            tips = list(plan.warnings)
+            if plan.out_of_band and not self.config.scan.enabled and self.config.radio.source != SOURCE_FILE:
+                text += " – turn on Scan (F6) to reach every channel"
+                tips.append("Scan (F6) steps the receiver between sets of channels so every channel is covered.")
+            self.status_plan.setToolTip(tooltip_text("\n".join(tips)))
         else:
             self.status_plan.setToolTip("")
         if self.status_plan.text() != text:
             self.status_plan.setText(text)
+
+    def _show_scan_sets(self, sets, current, cycle: float) -> None:
+        """Status bar summary of the scan sets (tooltip lists them). Called on every tick while scanning."""
+        key = (id(sets), len(sets), current, round(cycle, 1))
+        if key == self._scan_tip_key and self.status_plan.text().startswith("Scanning"):
+            return
+        self._scan_tip_key = key
+        names = {c.id: c.name for c in self.config.channels}
+        lines = []
+        for i, s in enumerate(sets):
+            ns = [names[cid] for cid in s.channel_ids if cid in names]
+            shown = ", ".join(ns[:6]) + (f" +{len(ns) - 6}" if len(ns) > 6 else "")
+            lines.append(f"{'▶ ' if i == current else ''}Set {s.number}: {s.label()} ({shown})")
+        self.status_plan.setText(f"Scanning {len(sets)} sets · full cycle ≈ {cycle:.1f} s when quiet")
+        self.status_plan.setToolTip(tooltip_text("\n".join(lines)))
+
+    # ================================================================ scanning
+    def set_scan_enabled(self, on: bool) -> None:
+        self.config.scan.enabled = bool(on)
+        self.engine.channels_changed()
+        self._update_plan_preview()
+
+    def set_scan_hold(self, on: bool) -> None:
+        self.engine.scan_hold = bool(on)
+
+    def scan_step(self, step: int) -> None:
+        if self.engine.scanning:
+            self.engine.scan_step(step)
+
+    def _on_scan_speed(self, value: float) -> None:
+        self.config.scan.listen_time = float(value)           # the scanner reads it live
+        if not self.engine.running:
+            self._update_plan_preview()
+
+    def _on_scan_dwell(self, value: float) -> None:
+        self.config.scan.dwell_time = float(value)
+
+    def _sync_scan_controls(self, scanning: bool | None = None) -> None:
+        sc = self.config.scan
+        for w, v in ((self.scan_speed, sc.listen_time), (self.scan_dwell, sc.dwell_time)):
+            if abs(w.value() - v) > 1e-9:
+                w.blockSignals(True)
+                w.setValue(v)
+                w.blockSignals(False)
+        for a, v in ((self.act_scan, sc.enabled), (self.act_hold, self.engine.scan_hold)):
+            if a.isChecked() != v:
+                a.blockSignals(True)
+                a.setChecked(v)
+                a.blockSignals(False)
+        scanning = self.engine.scanning if scanning is None else scanning
+        self.act_hold.setEnabled(sc.enabled)
+        self.act_scan_prev.setEnabled(scanning)
+        self.act_scan_next.setEnabled(scanning)
+
+    def _show_scan_status(self, sc) -> None:
+        if sc is None:
+            if self.scan_status.text():
+                self.scan_status.setText("")
+            return
+        if sc.state == "single":
+            text = "all channels fit in one tuning"
+        else:
+            cur = sc.sets[sc.index]
+            text = f"Set {cur.number}/{len(sc.sets)} · {cur.label()} · {SCAN_STATE_TEXT.get(sc.state, sc.state)}"
+            if sc.skipped:
+                text += f" · {len(sc.skipped)} skipped"
+            self._show_scan_sets(sc.sets, sc.index, sc.cycle_seconds)
+        if self.scan_status.text() != text:
+            self.scan_status.setText(text)
 
     def _show_load_warnings(self, cfg: AppConfig) -> None:
         if cfg.load_warnings:
@@ -1083,6 +1226,7 @@ class MainWindow(QMainWindow):
         self.act_start.setText("■ Stop" if running else "▶ Start")
         if not running:
             self.status_src.setText("Stopped")
+            self._last_scan = None
             self._update_plan_preview()
 
     def open_settings(self) -> None:
@@ -1097,6 +1241,7 @@ class MainWindow(QMainWindow):
             else:
                 self.engine.radio_changed()
         self._update_plan_preview()
+        self._sync_scan_controls()
 
     def _toggle_iq(self, on: bool) -> None:
         if on:
@@ -1127,12 +1272,21 @@ class MainWindow(QMainWindow):
             self.messages.appendPlainText(m)
             self.statusBar().showMessage(m.split("\n")[0], 8000)
         if snap.sample_rate > 0:
-            band = (snap.spectrum_lo, snap.spectrum_hi, snap.center)
-            if band != self._last_band:
-                self._last_band = band
-                self.spectrum.set_band(*band)
-        if snap.spectrum_rows and (self.view.show_spectrum or self.view.show_waterfall):
-            self.spectrum.add_rows(snap.spectrum_rows)
+            # Rows are grouped by the tuning they were taken at; while scanning, each scan set
+            # keeps its own waterfall (SpectrumView remembers one per band).
+            groups: list[tuple[float, list]] = []
+            for c, row in zip(snap.spectrum_centers, snap.spectrum_rows):
+                if groups and groups[-1][0] == c:
+                    groups[-1][1].append(row)
+                else:
+                    groups.append((c, [row]))
+            show = self.view.show_spectrum or self.view.show_waterfall
+            for c, rows in groups:
+                self._set_band(c, snap.sample_rate)
+                if show:
+                    self.spectrum.add_rows(rows)
+            if not groups:
+                self._set_band(snap.center, snap.sample_rate)
         for cid, strip in self.channel_list.strips.items():
             st = snap.channels.get(cid)
             strip.update_status(st if snap.running else None)
@@ -1149,9 +1303,21 @@ class MainWindow(QMainWindow):
             self.status_src.setText(f"{state} · {snap.center / 1e6:.4f} MHz · {snap.sample_rate / 1e6:.3f} MS/s"
                                     + (" · ● IQ REC" if snap.iq_recording else ""))
             self.status_load.setText(f"DSP load {snap.dsp_load * 100:.0f}%  dropped {snap.dropped}")
-            self._show_plan(snap.plan)
+            scanning = snap.scan is not None and snap.scan.state != "single"
+            if not scanning:
+                self._show_plan(snap.plan)
+            self._show_scan_status(snap.scan)
+            self._last_scan = snap.scan
+            if scanning != self.act_scan_next.isEnabled():
+                self._sync_scan_controls(scanning)
         else:
             self.status_load.setText("")
+
+    def _set_band(self, center: float, fs: float) -> None:
+        band = (center - fs / 2, center + fs / 2, center)
+        if band != self._last_band:
+            self._last_band = band
+            self.spectrum.set_band(*band)
 
     def _slow_tick(self) -> None:
         self._refresh_timeline()
@@ -1293,6 +1459,7 @@ class MainWindow(QMainWindow):
         self.engine.spectrum_fft = self.view.fft_size
         self.timeline_minutes.setValue(cfg.timeline_minutes)
         self._last_band = None
+        self._last_scan = None
         self._heard.clear()
         self._prev_open.clear()
         self.channel_list.set_selection([])
