@@ -36,6 +36,7 @@ class MainWindow(QMainWindow):
         self.engine = Engine(config)
         self.events: list[ActivityEvent] = []
         self._last_band = None
+        self._autosave = True          # save the session as last_profile.json on close
         self.setWindowTitle("SDR Multi-Channel Scanner")
         self.resize(1280, 900)
 
@@ -371,8 +372,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev) -> None:
         self.engine.stop()
-        try:
-            save_profile(self.config, last_profile_path())
-        except OSError:
-            pass
+        if self._autosave:
+            try:
+                save_profile(self.config, last_profile_path())
+            except OSError:
+                pass
         super().closeEvent(ev)

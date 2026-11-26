@@ -10,3 +10,4 @@ venv/
 *.sigmf-meta
 *.cu8
 *.wav
+.venv-build/

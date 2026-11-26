@@ -29,9 +29,24 @@ Out of scope: digital voice (P25, DMR, NXDN), trunking, AM/airband, transmit.
 
 ## Install
 
-Python 3.10 or newer is required (tested with 3.13).
+### Windows: ready-made .exe (no Python needed)
 
-### Windows 10/11
+1. Download `SDRScanner-<version>-win64.zip`. Releases are on the repository's
+   *Releases* page. Every build of `main` is also attached to its run of the
+   *Windows build* workflow on the *Actions* tab.
+2. Extract the zip anywhere, for example `C:\Program Files\SDRScanner` or your
+   Desktop. Keep the `_internal` folder next to `SDRScanner.exe`.
+3. Install the WinUSB driver with Zadig (step 3 below). It's needed once per
+   dongle.
+4. Run `SDRScanner.exe`.
+
+Windows SmartScreen may warn about an unrecognised app because the exe isn't
+code-signed. Click *More info → Run anyway*. You can build the exe yourself
+instead; see [Building the Windows .exe](#building-the-windows-exe).
+
+### Windows: from source
+
+Python 3.10 or newer is required (tested with 3.12 and 3.13).
 
 1. **Install Python** from python.org. Tick "Add python.exe to PATH".
 2. **Get the code and install dependencies** (PowerShell, in the project folder):
@@ -61,12 +76,17 @@ V4** dongles need the RTL-SDR Blog driver fork:
 
 1. Download the latest Windows release from
    <https://github.com/rtlsdrblog/rtl-sdr-blog/releases> (`Release.zip`, x64).
-2. `pip uninstall pyrtlsdrlib` so the bundled DLL is not loaded first.
-3. Copy `rtlsdr.dll` (or `librtlsdr.dll`) and `libusb-1.0.dll` from the zip
-   into the project folder, next to `run_scanner.bat`, or anywhere on `PATH`.
+2. Copy `rtlsdr.dll` (or `librtlsdr.dll`) and `libusb-1.0.dll` from the zip
+   into the folder that holds `SDRScanner.exe` (exe build) or `run_scanner.bat`
+   (source checkout).
+
+A `rtlsdr.dll`/`librtlsdr.dll` in that folder is used automatically in place of
+the bundled one. You don't need to uninstall anything or change `PATH`.
 
 To check that the library loads, open *Radio settings → Detect devices*. Your
-dongle should be listed.
+dongle should be listed. You can also run `SDRScanner.exe --self-test report.txt`
+(or `python -m sdrscanner --self-test`). It reports which librtlsdr was loaded
+and how many dongles it sees.
 
 ### Linux
 
@@ -222,6 +242,40 @@ profiles, every file format, rtl_tcp against a fake server, an end-to-end
 engine run on generated IQ, and a headless GUI smoke test. On a headless Linux
 box, run with `QT_QPA_PLATFORM=offscreen`.
 
+### Building the Windows .exe
+
+From PowerShell in the project folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+```
+
+The script:
+1. creates a clean `.venv-build` environment and installs the dependencies
+   plus PyInstaller;
+2. builds `dist\SDRScanner\SDRScanner.exe` from `packaging\sdrscanner.spec`;
+3. runs the exe's self-test;
+4. zips the folder to `dist\SDRScanner-<version>-win64.zip`.
+
+Add `-OneFile` for a single `SDRScanner.exe`. It starts slower because it
+unpacks itself on every launch, and antivirus flags it more often.
+
+The bundle includes Python, Qt, NumPy/SciPy, PortAudio (from `sounddevice`) and
+librtlsdr (from `pyrtlsdrlib`, with libusb statically linked). Users only need
+the Zadig driver.
+
+The *Windows build* GitHub Actions workflow (`.github/workflows/windows-build.yml`)
+does the same on every push and pull request. It runs the test suite on
+Windows, builds the exe, runs its self-test, and uploads the zip as an
+artifact. Pushing a tag such as `v0.1.0` also publishes the zip as a GitHub
+release. When you bump the version, update `sdrscanner/__init__.py`,
+`pyproject.toml` and `packaging/version_info.txt`.
+
+`--self-test` checks the DSP chain, PortAudio, librtlsdr loading, and the GUI
+with an IQ playback run. No dongle or sound card is needed. It exits non-zero on
+failure, and because the exe has no console window, it writes its report to the
+file you name.
+
 Package layout:
 
 ```
@@ -234,14 +288,17 @@ sdrscanner/
   activity.py   activity events, CSV export, WAV + IQ recorders
   engine.py     reader/DSP threads, retuning, mixing, GUI snapshots
   gui/          PySide6 + pyqtgraph user interface
+  native.py     librtlsdr DLL discovery (user-supplied DLL overrides the bundled one)
+  selftest.py   --self-test installation check
   tools/gen_iq.py  synthetic multi-channel test-signal generator
+packaging/      PyInstaller spec, launcher, icon, Windows build script
 ```
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| "librtlsdr could not be loaded" | Install `pyrtlsdr[lib]`, or put `librtlsdr.dll`/`rtlsdr.dll` + `libusb-1.0.dll` next to the program (Windows). On Linux install `librtlsdr0`. |
+| "librtlsdr could not be loaded" | Install `pyrtlsdr[lib]`, or put `librtlsdr.dll`/`rtlsdr.dll` + `libusb-1.0.dll` next to `SDRScanner.exe` / `run_scanner.bat` (Windows). On Linux install `librtlsdr0`. Run `--self-test` to see which library is picked up. |
 | "Cannot open RTL-SDR #0" (retrying) | Windows: redo the Zadig step for Interface 0. Linux: blacklist `dvb_usb_rtl28xxu` and check udev permissions. Close other SDR programs, since only one can use the dongle. |
 | Channels are a few kHz off | Set *Frequency correction (ppm)*. Tune a known signal and adjust until it sits centred in its marker. |
 | Choppy audio, "dropped" counter rising | Lower the sample rate, use fewer channels, or close CPU-heavy programs. Check the *DSP load* figure in the status bar. |
