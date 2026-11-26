@@ -6,9 +6,18 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Publish a release with this tag (e.g. v0.0.1). Leave empty to only build. Run from main."
+        required: false
+        default: ""
 
 permissions:
   contents: read
+
+env:
+  # Tag being released: a pushed v* tag, or the manual-run input (main only).
+  RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.release_tag) || '' }}
 
 jobs:
   build:
@@ -23,12 +32,12 @@ jobs:
           cache: pip
           cache-dependency-path: requirements*.txt
 
-      - name: Check tag matches the app version
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Check release tag matches the app version
+        if: env.RELEASE_TAG != ''
         shell: pwsh
         run: |
           $v = (python -c "import sdrscanner; print(sdrscanner.__version__)").Trim()
-          if ("v$v" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match sdrscanner.__version__ ($v)" }
+          if ("v$v" -ne $env:RELEASE_TAG) { throw "Release tag $env:RELEASE_TAG does not match sdrscanner.__version__ ($v)" }
 
       - name: Run tests
         env:
@@ -52,8 +61,10 @@ jobs:
           if-no-files-found: error
 
   release:
-    # Push a tag like v0.1.0 to publish the zip as a GitHub release.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Push a tag like v0.0.1, or run this workflow manually on main with
+    # release_tag set, to publish the zip as a GitHub release. A manual run
+    # creates the tag on the commit it built.
+    if: needs.build.result == 'success' && (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.release_tag != ''))
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -64,5 +75,8 @@ jobs:
           name: SDRScanner-win64
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: SDR Scanner ${{ env.RELEASE_TAG }}
           files: SDRScanner-*-win64.zip
           generate_release_notes: true
